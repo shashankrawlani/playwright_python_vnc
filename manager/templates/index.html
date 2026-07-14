@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Persona Manager · PyPlayVNC</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --border:   #2a2d3e;
+      --accent:   #7c6aff;
+      --accent2:  #00c896;
+      --danger:   #ff4d6d;
+      --warn:     #f5a623;
+      --text:     #e2e8f0;
+      --muted:    #6b7280;
+      --radius:   10px;
+      --font:     'Inter', system-ui, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    /* ── Layout ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 28px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    header h1 { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
+    header h1 span { color: var(--accent); }
+
+    .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-weight: 600;
+    }
+    .badge-active  { background: #14532d; color: #4ade80; }
+    .badge-idle    { background: #1c1917; color: #a8a29e; }
+    .badge-session { background: #1e3a5f; color: #60a5fa; }
+
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 28px 20px;
+    }
+
+    /* ── Toolbar ── */
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 22px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .toolbar-right { margin-left: auto; display: flex; gap: 8px; }
+
+    /* ── Cards grid ── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      transition: border-color .15s;
+    }
+    .card:hover { border-color: var(--accent); }
+    .card.running { border-color: var(--accent2); }
+
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .card-name {
+      font-size: 16px;
+      font-weight: 700;
+      word-break: break-all;
+    }
+    .card-desc { color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+    .accounts { display: flex; flex-direction: column; gap: 4px; }
+    .account-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      background: #1e2235;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 3px 8px;
+      color: #94a3b8;
+    }
+    .account-tag strong { color: var(--text); }
+
+    .card-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: auto;
+      padding-top: 4px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── Buttons ── */
+    button, .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 7px;
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      font-family: var(--font);
+      transition: opacity .15s, transform .1s;
+      white-space: nowrap;
+    }
+    button:active { transform: scale(.97); }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+
+    .btn-primary   { background: var(--accent); color: #fff; }
+    .btn-success   { background: #065f46; color: #6ee7b7; }
+    .btn-danger    { background: #7f1d1d; color: #fca5a5; }
+    .btn-warn      { background: #78350f; color: #fcd34d; }
+    .btn-ghost     { background: var(--border); color: var(--text); }
+    .btn-sm        { padding: 5px 10px; font-size: 12px; border-radius: 6px; }
+
+    /* ── Modal ── */
+    .overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,.7);
+      z-index: 100;
+      align-items: center;
+      justify-content: center;
+    }
+    .overlay.open { display: flex; }
+
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      width: 460px;
+      max-width: 95vw;
+      max-height: 90vh;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .modal h2 { font-size: 17px; font-weight: 700; }
+
+    /* ── Form ── */
+    .form-group { display: flex; flex-direction: column; gap: 6px; }
+    label { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+    input, textarea, select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      padding: 9px 12px;
+      width: 100%;
+      transition: border-color .15s;
+    }
+    input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    textarea { resize: vertical; min-height: 70px; }
+
+    .account-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 8px;
+      align-items: end;
+    }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 12px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 8px 32px rgba(0,0,0,.5);
+      z-index: 200;
+      opacity: 0;
+      transform: translateY(10px);
+      transition: all .25s;
+      pointer-events: none;
+      max-width: 320px;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+    #toast.ok   { border-color: var(--accent2); color: var(--accent2); }
+    #toast.err  { border-color: var(--danger); color: var(--danger); }
+
+    /* ── Empty state ── */
+    .empty {
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--muted);
+    }
+    .empty .icon { font-size: 48px; margin-bottom: 12px; }
+
+    /* ── URL input row ── */
+    .url-row { display: flex; gap: 8px; align-items: center; }
+    .url-row input { flex: 1; }
+
+    /* ── Spinner ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spin { display: inline-block; animation: spin .7s linear infinite; }
+
+    /* ── Notes ── */
+    .notes-text {
+      font-size: 12px;
+      color: var(--muted);
+      font-style: italic;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🎭 <span>Persona</span> Manager</h1>
+  <div id="headerStatus" style="color:var(--muted);font-size:12px;">Loading…</div>
+</header>
+
+<main>
+  <div class="toolbar">
+    <button class="btn-primary" onclick="openCreateModal()">＋ New Persona</button>
+    <div class="toolbar-right">
+      <button class="btn-ghost" onclick="loadPersonas()" title="Refresh">⟳ Refresh</button>
+      <button class="btn-ghost" onclick="resetKey()" title="Change API key">🔑 Key</button>
+    </div>
+  </div>
+
+  <div id="grid" class="grid"></div>
+</main>
+
+<!-- ── Create / Edit Modal ── -->
+<div id="modalOverlay" class="overlay" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h2 id="modalTitle">New Persona</h2>
+
+    <div class="form-group">
+      <label>Name <span style="color:var(--muted)">(alphanumeric, hyphens, underscores)</span></label>
+      <input id="f_name" placeholder="e.g. work-gmail" />
+    </div>
+
+    <div class="form-group">
+      <label>Description</label>
+      <input id="f_desc" placeholder="e.g. Work Gmail account" />
+    </div>
+
+    <div class="form-group">
+      <label>Accounts</label>
+      <div id="accountsContainer"></div>
+      <button class="btn-ghost btn-sm" style="margin-top:6px" onclick="addAccountRow()">＋ Add Account</button>
+    </div>
+
+    <div class="form-group">
+      <label>Notes</label>
+      <textarea id="f_notes" placeholder="Any notes about this persona…"></textarea>
+    </div>
+
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
+      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary" id="modalSaveBtn" onclick="savePersona()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Launch Modal ── -->
+<div id="launchOverlay" class="overlay" onclick="closeLaunchModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h2>Launch Browser</h2>
+    <p style="color:var(--muted);font-size:13px;line-height:1.6">
+      Opens raw Chromium (no automation flags) in the VNC session so you can
+      login manually. Connect to <strong>homelab:5900</strong> via VNC to see it.
+    </p>
+    <div class="form-group">
+      <label>Starting URL</label>
+      <input id="launchUrl" value="https://mail.google.com" />
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
+      <button class="btn-ghost" onclick="closeLaunchModal()">Cancel</button>
+      <button class="btn-success" id="launchConfirmBtn" onclick="confirmLaunch()">🚀 Launch</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast ── -->
+<div id="toast"></div>
+
+<script>
+// ─────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────
+let personas = [];
+let editingName = null;   // null = create mode, string = edit mode
+let launchingName = null;
+
+// ─────────────────────────────────────────────
+// API Key — stored in sessionStorage (cleared on tab close)
+// ─────────────────────────────────────────────
+function getApiKey() {
+  return sessionStorage.getItem('pyplayvnc_api_key') || '';
+}
+
+function promptForKey() {
+  const key = prompt('Enter your PyPlayVNC API key:');
+  if (key) {
+    sessionStorage.setItem('pyplayvnc_api_key', key.trim());
+    return key.trim();
+  }
+  return '';
+}
+
+// ─────────────────────────────────────────────
+// API helpers
+// ─────────────────────────────────────────────
+const API = '';  // same origin
+
+async function api(method, path, body) {
+  let key = getApiKey();
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': key,
+    }
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(API + path, opts);
+  if (r.status === 401 || r.status === 403) {
+    // Key missing or wrong — prompt and retry once
+    sessionStorage.removeItem('pyplayvnc_api_key');
+    key = promptForKey();
+    if (!key) throw new Error('API key required');
+    opts.headers['X-API-Key'] = key;
+    const r2 = await fetch(API + path, opts);
+    if (!r2.ok) {
+      const d = await r2.json().catch(() => ({}));
+      throw new Error(d.detail || r2.statusText);
+    }
+    if (r2.status === 204) return null;
+    return r2.json();
+  }
+  if (r.status === 204) return null;
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+
+// ─────────────────────────────────────────────
+// Load & render
+// ─────────────────────────────────────────────
+async function loadPersonas() {
+  try {
+    personas = await api('GET', '/api/personas');
+    render();
+    document.getElementById('headerStatus').textContent =
+      `${personas.length} persona${personas.length !== 1 ? 's' : ''} · ${new Date().toLocaleTimeString()}`;
+  } catch(e) {
+    toast('Failed to load: ' + e.message, 'err');
+  }
+}
+
+function render() {
+  const grid = document.getElementById('grid');
+  if (!personas.length) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1">
+      <div class="icon">🎭</div>
+      <div>No personas yet. Click <strong>+ New Persona</strong> to get started.</div>
+    </div>`;
+    return;
+  }
+  grid.innerHTML = personas.map(p => cardHtml(p)).join('');
+}
+
+function cardHtml(p) {
+  const running = p.browser_running;
+  const session = p.has_session;
+  const statusBadge = running
+    ? `<span class="badge badge-active">● Running</span>`
+    : session
+      ? `<span class="badge badge-session">✓ Session saved</span>`
+      : `<span class="badge badge-idle">○ No session</span>`;
+
+  const accounts = p.meta.accounts.length
+    ? `<div class="accounts">${p.meta.accounts.map(a =>
+        `<span class="account-tag">🌐 <strong>${a.site}</strong> ${a.email}</span>`
+      ).join('')}</div>`
+    : '';
+
+  const notes = p.meta.notes
+    ? `<div class="notes-text">${escHtml(p.meta.notes)}</div>` : '';
+
+  const launchBtn = running
+    ? `<button class="btn-warn btn-sm" onclick="killBrowser('${p.name}')">⏹ Stop Browser</button>`
+    : `<button class="btn-success btn-sm" onclick="openLaunchModal('${p.name}')">▶ Open Browser</button>`;
+
+  return `
+    <div class="card ${running ? 'running' : ''}" id="card-${p.name}">
+      <div class="card-header">
+        <div>
+          <div class="card-name">${escHtml(p.name)}</div>
+          ${statusBadge}
+        </div>
+      </div>
+      ${p.meta.description ? `<div class="card-desc">${escHtml(p.meta.description)}</div>` : ''}
+      ${accounts}
+      ${notes}
+      <div class="card-actions">
+        ${launchBtn}
+        <button class="btn-ghost btn-sm" onclick="openEditModal('${p.name}')">✎ Edit</button>
+        <button class="btn-danger btn-sm" onclick="deletePersona('${p.name}')">🗑</button>
+      </div>
+    </div>`;
+}
+
+// ─────────────────────────────────────────────
+// Create / Edit Modal
+// ─────────────────────────────────────────────
+function openCreateModal() {
+  editingName = null;
+  document.getElementById('modalTitle').textContent = 'New Persona';
+  document.getElementById('f_name').value = '';
+  document.getElementById('f_name').disabled = false;
+  document.getElementById('f_desc').value = '';
+  document.getElementById('f_notes').value = '';
+  document.getElementById('accountsContainer').innerHTML = '';
+  document.getElementById('modalSaveBtn').textContent = 'Create';
+  document.getElementById('modalOverlay').classList.add('open');
+  document.getElementById('f_name').focus();
+}
+
+function openEditModal(name) {
+  const p = personas.find(x => x.name === name);
+  if (!p) return;
+  editingName = name;
+  document.getElementById('modalTitle').textContent = `Edit · ${name}`;
+  document.getElementById('f_name').value = name;
+  document.getElementById('f_name').disabled = true;
+  document.getElementById('f_desc').value = p.meta.description || '';
+  document.getElementById('f_notes').value = p.meta.notes || '';
+  document.getElementById('accountsContainer').innerHTML = '';
+  (p.meta.accounts || []).forEach(a => addAccountRow(a.site, a.email));
+  document.getElementById('modalSaveBtn').textContent = 'Save Changes';
+  document.getElementById('modalOverlay').classList.add('open');
+  document.getElementById('f_desc').focus();
+}
+
+function closeModal(e) {
+  if (e && e.target !== document.getElementById('modalOverlay')) return;
+  document.getElementById('modalOverlay').classList.remove('open');
+}
+
+function addAccountRow(site = '', email = '') {
+  const container = document.getElementById('accountsContainer');
+  const row = document.createElement('div');
+  row.className = 'account-row';
+  row.style.marginBottom = '6px';
+  row.innerHTML = `
+    <div class="form-group" style="margin:0">
+      <label>Site</label>
+      <input class="acc-site" placeholder="gmail.com" value="${escHtml(site)}" />
+    </div>
+    <div class="form-group" style="margin:0">
+      <label>Email</label>
+      <input class="acc-email" placeholder="[REMOVED]" value="${escHtml(email)}" />
+    </div>
+    <button class="btn-danger btn-sm" style="margin-top:18px" onclick="this.closest('.account-row').remove()">✕</button>`;
+  container.appendChild(row);
+}
+
+async function savePersona() {
+  const name = document.getElementById('f_name').value.trim();
+  const description = document.getElementById('f_desc').value.trim();
+  const notes = document.getElementById('f_notes').value.trim();
+  const accounts = [...document.querySelectorAll('.account-row')].map(row => ({
+    site:  row.querySelector('.acc-site').value.trim(),
+    email: row.querySelector('.acc-email').value.trim(),
+  })).filter(a => a.site && a.email);
+
+  if (!name) { toast('Name is required', 'err'); return; }
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    toast('Name: only letters, numbers, hyphens, underscores', 'err'); return;
+  }
+
+  const btn = document.getElementById('modalSaveBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin">⟳</span> Saving…';
+
+  try {
+    if (editingName) {
+      await api('PUT', `/api/personas/${editingName}`, { description, accounts, notes });
+      toast(`Updated ${editingName}`, 'ok');
+    } else {
+      await api('POST', '/api/personas', { name, description, accounts, notes });
+      toast(`Created ${name}`, 'ok');
+    }
+    document.getElementById('modalOverlay').classList.remove('open');
+    await loadPersonas();
+  } catch(e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = editingName ? 'Save Changes' : 'Create';
+  }
+}
+
+// ─────────────────────────────────────────────
+// Delete
+// ─────────────────────────────────────────────
+async function deletePersona(name) {
+  if (!confirm(`Delete persona "${name}"?\nThis will permanently remove all Chrome profile data.`)) return;
+  try {
+    await api('DELETE', `/api/personas/${name}`);
+    toast(`Deleted ${name}`, 'ok');
+    await loadPersonas();
+  } catch(e) {
+    toast(e.message, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────
+// Browser control
+// ─────────────────────────────────────────────
+function openLaunchModal(name) {
+  launchingName = name;
+  document.getElementById('launchUrl').value = 'https://mail.google.com';
+  document.getElementById('launchOverlay').classList.add('open');
+  document.getElementById('launchUrl').focus();
+}
+
+function closeLaunchModal(e) {
+  if (e && e.target !== document.getElementById('launchOverlay')) return;
+  document.getElementById('launchOverlay').classList.remove('open');
+}
+
+async function confirmLaunch() {
+  const url = document.getElementById('launchUrl').value.trim() || 'https://mail.google.com';
+  const btn = document.getElementById('launchConfirmBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin">⟳</span> Launching…';
+  try {
+    const r = await api('POST', `/api/personas/${launchingName}/launch?url=${encodeURIComponent(url)}`);
+    toast(`Browser launched for ${launchingName} (PID ${r.pid}) — check VNC :5900`, 'ok');
+    document.getElementById('launchOverlay').classList.remove('open');
+    await loadPersonas();
+  } catch(e) {
+    toast(e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '🚀 Launch';
+  }
+}
+
+async function killBrowser(name) {
+  try {
+    await api('POST', `/api/personas/${name}/kill`);
+    toast(`Browser stopped for ${name}`, 'ok');
+    await loadPersonas();
+  } catch(e) {
+    toast(e.message, 'err');
+  }
+}
+
+// ─────────────────────────────────────────────
+// Toast
+// ─────────────────────────────────────────────
+let toastTimer;
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = `show ${type}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ─────────────────────────────────────────────
+// Util
+// ─────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ─────────────────────────────────────────────
+// Keyboard shortcuts
+// ─────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    document.getElementById('modalOverlay').classList.remove('open');
+    document.getElementById('launchOverlay').classList.remove('open');
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') savePersona();
+});
+
+function resetKey() {
+  sessionStorage.removeItem('pyplayvnc_api_key');
+  promptForKey();
+  loadPersonas();
+}
+
+// ─────────────────────────────────────────────
+// Init + Auto-refresh every 10s
+// ─────────────────────────────────────────────
+// Prompt for key on first load if not set
+if (!getApiKey()) promptForKey();
+loadPersonas();
+setInterval(loadPersonas, 10000);
+</script>
+</body>
+</html>

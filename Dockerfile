@@ -1,17 +1,14 @@
-FROM mcr.microsoft.com/playwright/python:v1.51.0-noble
+FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install additional system dependencies for Xvfb, VNC, and window manager
-RUN apt-get update && apt-get install -y \
+# Install system dependencies for Xvfb, VNC, window manager,
+# and any remaining Playwright browser deps not covered by the base image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     x11vnc \
     fluxbox \
     vim \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install optional dependencies for Playwright
-RUN apt-get update && apt-get install -y \
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -26,29 +23,30 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY entry_point.sh .
+# container/ holds everything that runs inside the image
+COPY container/entry_point.sh .
+COPY container/run_browser.sh .
+COPY container/scripts/ ./scripts/
+COPY .env .
 
-RUN pip install playwright==1.51.0
-
-# Ensure Playwright and its dependencies are installed
-RUN playwright install && playwright install-deps
+# Install Playwright Python package and browser binaries
+RUN pip install --no-cache-dir --break-system-packages playwright==1.61.0 \
+    && playwright install \
+    && playwright install-deps
 
 # Set executable permissions
-RUN chmod +x entry_point.sh
+RUN chmod +x entry_point.sh run_browser.sh
 
-# Ensure directories are writable
-RUN mkdir -p /app/user_data/
-RUN mkdir -p /app/user_data/
-RUN mkdir -p /shared
-RUN chmod -R 777 /app/user_data
-RUN mkdir -p /shared
+# Create required directories (profiles/ is mounted at runtime via volume)
+RUN mkdir -p /app/profiles /app/user_data /shared \
+    && chmod -R 777 /app/profiles /app/user_data /shared
 
 # Environment variables
 ENV DISPLAY=:99
 ENV USER_DATA_DIR=/app/user_data
+ENV PROFILES_ROOT=/app/profiles
 
-# Expose ports
+# VNC port — manager port 8080 is exposed by the manager service in docker-compose
 EXPOSE 5900
 
-# Default command
 CMD ["/app/entry_point.sh"]

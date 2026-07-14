@@ -1,0 +1,112 @@
+# ── Secrets ───────────────────────────────────────────────────
+.env
+*.env
+!.env.example
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# ── Chrome profile data ───────────────────────────────────────
+# Default/ and its contents ARE committed so sessions survive migration.
+# We exclude only large caches, machine-specific locks, and generated data
+# that Chrome recreates automatically.
+
+# Singleton locks — machine-specific, recreated on start
+profiles/*/SingletonLock
+profiles/*/SingletonCookie
+profiles/*/SingletonSocket
+
+# Chrome-managed root files (recreated automatically)
+profiles/*/Local State
+profiles/*/Local State-journal
+profiles/*/First Run
+profiles/*/Last Version
+profiles/*/BrowserMetrics*
+profiles/*/Variations
+profiles/*/first_party_sets.db
+profiles/*/first_party_sets.db-journal
+
+# Large caches (can be hundreds of MB, not needed for session)
+profiles/*/Default/Cache/
+profiles/*/Default/Code Cache/
+profiles/*/Default/GPUCache/
+profiles/*/Default/DawnGraphiteCache/
+profiles/*/Default/DawnWebGPUCache/
+profiles/*/Default/ShaderCache/
+profiles/*/Default/Service Worker/CacheStorage/
+
+# Downloaded components (Chrome re-downloads these)
+profiles/*/GPUPersistentCache/
+profiles/*/GraphiteDawnCache/
+profiles/*/component_crx_cache/
+profiles/*/extensions_crx_cache/
+profiles/*/NativeMessagingHosts/
+profiles/*/OnDeviceHeadSuggestModel/
+profiles/*/OptimizationHints/
+profiles/*/WasmTtsEngine/
+profiles/*/WidevineCdm/
+profiles/*/Dictionaries/
+profiles/*/MEIPreload/
+profiles/*/TranslateKit/
+profiles/*/hyphen-data/
+profiles/*/ZxcvbnData/
+profiles/*/CaptchaProviders/
+profiles/*/CertificateRevocation/
+profiles/*/Crowd Deny/
+profiles/*/FileTypePolicies/
+profiles/*/FirstPartySetsPreloaded/
+profiles/*/OriginTrials/
+profiles/*/PKIMetadata/
+profiles/*/PKIMetadataFastpush/
+profiles/*/PrivacySandboxAttestationsPreloaded/
+profiles/*/SafetyTips/
+profiles/*/SSLErrorAssistant/
+profiles/*/Subresource Filter/
+profiles/*/TrustTokenKeyCommitments/
+profiles/*/Variations/
+profiles/*/ActorSafetyLists/
+profiles/*/AmountExtractionHeuristicRegexes/
+profiles/*/CrowdDeny/
+profiles/*/HistorySearch/
+
+# Crash data (not useful in git)
+profiles/*/Crash Reports/
+
+# Always allow metadata and placeholders
+!profiles/**/persona.yml
+!profiles/**/.gitkeep
+
+# ── Shared volume ─────────────────────────────────────────────
+shared/
+
+# ── Playwright output ─────────────────────────────────────────
+playwright-report/
+test-results/
+playwright-scripts/outputs/
+*.png
+*.zip
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS / Editor ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

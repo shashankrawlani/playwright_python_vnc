@@ -1,229 +1,313 @@
-# 🌀 PyPlayVNC - Lightweight Container for Playwright, Python, and VNC
+# PyPlayVNC
 
-## DockerHub: [shashankrawlani/playwright_python_vnc](https://hub.docker.com/repository/docker/shashankrawlani/playwright_python_vnc)
+Dockerized persistent Chrome browser automation with multi-persona profile management,
+VNC access, and a REST API + web UI for control.
 
-**PyPlayVNC** is a Dockerized environment for visual browser automation using [Playwright](https://playwright.dev/python/), with Python scripting, a virtual display, and VNC access for remote debugging. It’s perfect for tasks like:
-
-- Headless browser automation with GUI fallback
-- Multi-profile browser testing
-- Visual debugging via VNC
-
-> 🐍 Python + 🎭 Playwright + 🖥️ VNC + 📦 Xvfb + 🎛️ Fluxbox
+**Stack:** Python 3.12 · Playwright 1.61.0 · Chromium 149 · Xvfb · x11vnc · Fluxbox · FastAPI
 
 ---
 
-## 🚀 Features
+## What It Does
 
-- **🐍 Python** — for scripting and automation.
-- **🎭 Playwright** — supports Chromium, Firefox, and WebKit.
-- **🖥️ VNC** — connect to a visual session of your headless browser.
-- **📦 Xvfb** — provides a virtual display for browser rendering.
-- **🎛️ Fluxbox** — lightweight window manager for the VNC session.
-- **🧩 Modular Entry Point** — `entry_point.sh` now uses shell functions.
-- **📂 Mountable User Profiles** — make `/app/user_data` persistent via volumes.
-- **🧠 Monkey Patch Option** — replace `launch()` globally with `launch_persistent_context()`.
+- Runs persistent Chrome sessions called **personas** inside Docker
+- Each persona has its own isolated Chrome profile — separate cookies, logins, history
+- VNC access (port 5900) lets you see and interact with the browser visually
+- Persona Manager (port 8888) lets you create, launch, and control personas via web UI or REST API
+- Playwright automation scripts reuse saved login sessions without triggering bot detection
+- Profiles are stored on the host — portable, easy to back up and migrate
 
 ---
 
-## 📂 Directory Structure
+## Architecture
 
-- `/app/user_data`: Browser profiles and persistent session data.
-- `/shared`: Shared volume mount point between host and container.
-
----
-
-## 🛠️ Environment Variables
-
-| Variable        | Default          | Description                         |
-| --------------- | ---------------- | ----------------------------------- |
-| `DISPLAY`       | `:99`            | Virtual display ID used by Xvfb     |
-| `USER_DATA_DIR` | `/app/user_data` | Stores browser session/profile data |
-
----
-
-## ✅ Startup Checks
-
-On container startup, the following checks are performed automatically:
-
-- 🐍 **Python** version check
-- 🎭 **Playwright** installation (Python & CLI)
-- 📦 Xvfb virtual display launch
-- 🖥️ x11vnc (VNC server) startup
-- 🎛️ Fluxbox window manager startup
-
----
-
-## 🧪 Usage
-
-### 1. Pull the Docker Image
-
-```bash
-docker pull shashankrawlani/playwright_python_vnc:latest
+```
+┌─────────────────────────────────────────────────┐
+│  Host machine                                   │
+│                                                 │
+│  ./profiles/          ← Chrome profiles (host   │
+│    default/           ←   volume, persisted)    │
+│    example-persona/                            │
+│                                                 │
+│  ┌──────────────────────────────────────────┐   │
+│  │  playwright_vnc container                │   │
+│  │                                          │   │
+│  │  Xvfb :99  ←  x11vnc → port 5900 (VNC)  │   │
+│  │  Fluxbox                                 │   │
+│  │  Chrome (launched via docker exec)       │   │
+│  │                                          │   │
+│  │  port 8888 ──────────────────────────┐   │   │
+│  └──────────────────────────────────────┼───┘   │
+│                                         │       │
+│  ┌──────────────────────────────────────┼───┐   │
+│  │  persona_manager container           │   │   │
+│  │  (shares network namespace)          │   │   │
+│  │                                      │   │   │
+│  │  FastAPI on :8080 ───────────────────┘   │   │
+│  │  Uses docker exec to launch Chrome       │   │
+│  │  inside playwright_vnc (MIT-SHM fix)     │   │
+│  └──────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────┘
 ```
 
-### 2. Run the Container
+**Why `docker exec`?** Chrome uses X11 MIT-SHM (shared memory) for rendering. If Chrome
+runs in a different container than Xvfb, the shared memory segment can't be accessed and
+the screen stays blank. Chrome must run inside `playwright_vnc` to share its memory space.
+
+---
+
+## Quick Start
 
 ```bash
-docker run -it --rm   -p 5900:5900   -v $(pwd)/shared:/shared   shashankrawlani/playwright_python_vnc:latest
+git clone https://github.com/shashankrawlani/playwright_python_vnc
+cd playwright_python_vnc
+cp .env.example .env
+# Edit .env — generate and add API_KEY_HASH (see Auth section)
+docker compose up -d
 ```
 
-> ✅ **Port 5900** is exposed for VNC access.  
-> ✅ **`/shared`** is a mounted volume between host and container.
+**Access:**
+- Persona Manager UI: `http://localhost:8888`
+- VNC (live browser): `localhost:5900` — connect with any VNC viewer (no password)
+- API docs (Swagger): `http://localhost:8888/docs`
 
 ---
 
-## 🔍 Access the VNC Server
+## Auth Setup
 
-1. Install a VNC viewer (e.g., [RealVNC Viewer](https://www.realvnc.com/en/connect/download/viewer/)).
-2. Connect to `localhost:5900`.
-3. You’ll see the container's lightweight desktop environment.
-
----
-
-## 🧩 Customize Browser Profiles
-
-- Add or modify browser profiles under `/app/user_data`.
-- Great for testing with persistent sessions, cookies, and localStorage.
-
----
-
-## 🔐 Ensuring Persistent Browser Profiles in /app/user_data
-
-To make Playwright always use the `/app/user_data` directory for persistent browser profiles, follow these practices:
-
-- By default, Playwright does not persist sessions unless explicitly instructed.
-- Use `launch_persistent_context()` for persistent sessions (cookies, local storage, installed extensions, etc.).
-
-### ✅ Recommended Directory
-
-This container sets the default profile path using an environment variable:
+The manager API requires an API key. Only the SHA-256 hash is stored in `.env`.
 
 ```bash
-USER_DATA_DIR=/app/user_data
+python3 -c "
+import secrets, hashlib
+k = secrets.token_urlsafe(32)
+print('RAW  (save to password manager):', k)
+print('HASH (put in .env):', hashlib.sha256(k.encode()).hexdigest())
+"
+```
+
+Add to `.env`:
+```
+API_KEY_HASH=<the-hash-output>
+```
+
+Store the **raw key** in your password manager. Never put it in `.env` or commit it.
+
+---
+
+## Current Personas
+
+| Name | Account | Purpose |
+|---|---|---|
+| `default` | [REMOVED] | Default persona |
+| `example-persona` | [REMOVED] | Logistics account |
+
+---
+
+## Persona Workflow
+
+### 1 — Create a persona
+
+Via UI: `http://localhost:8888` → **+ New Persona**
+
+Via API:
+```bash
+curl -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  http://localhost:8888/api/personas \
+  -d '{"name":"work","description":"Work Gmail","accounts":[{"site":"gmail.com","email":"[REMOVED]"}]}'
+```
+
+### 2 — Login manually via VNC (once per persona)
+
+```bash
+curl -X POST -H "X-API-Key: $KEY" \
+  "http://localhost:8888/api/personas/work/launch?url=https://mail.google.com"
+```
+
+Connect to `localhost:5900` in your VNC viewer → complete login → close the browser.
+The session is saved to `profiles/work/`. You never need to repeat this.
+
+### 3 — Automate with Playwright
+
+```bash
+# Headless (no visible browser)
+docker compose exec -e PERSONA=work playwright-vnc \
+    python3 /app/scripts/open_persona.py --url https://mail.google.com --headless
+
+# Visible in VNC
+docker compose exec -e PERSONA=work playwright-vnc \
+    python3 /app/scripts/open_persona.py --url https://mail.google.com
 ```
 
 ---
 
-## 🧱 Option 1: Basic Persistent Context (Sync Example)
+## Persona Isolation
+
+Each persona is completely isolated:
+
+- Separate Chrome profile directory — no shared cookies, storage, or history
+- The `PERSONA` environment variable selects which profile is used
+- Scripts running with `PERSONA=work` never touch `PERSONA=default`
+- Two personas can NOT run simultaneously against the same profile directory
+
+**Never:**
+- Open the same persona in two browser instances at the same time
+- Expose or log the contents of `profiles/<name>/Default/Cookies`
+
+---
+
+## REST API
+
+All endpoints require `X-API-Key: <raw-key>` header.
+Full interactive docs: `http://localhost:8888/docs`
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/personas` | List all personas + status |
+| GET | `/api/personas/{name}` | Get one persona |
+| POST | `/api/personas` | Create persona |
+| PUT | `/api/personas/{name}` | Update metadata |
+| DELETE | `/api/personas/{name}` | Delete persona + all data |
+| POST | `/api/personas/{name}/launch` | Open browser for manual login |
+| POST | `/api/personas/{name}/kill` | Kill running browser |
+| GET | `/api/personas/{name}/status` | Running? Session saved? |
+
+---
+
+## Writing Automation Scripts
+
+Place scripts in `playwright-scripts/` (not committed):
 
 ```python
 from playwright.sync_api import sync_playwright
 import os
 
-USER_DATA_DIR = os.getenv("USER_DATA_DIR", "/app/user_data")
+PERSONA = os.getenv("PERSONA", "default")
+PROFILE_DIR = f"/app/profiles/{PERSONA}"
 
 with sync_playwright() as p:
-    browser = p.chromium.launch_persistent_context(
-        USER_DATA_DIR,
-        headless=False,
-        args=["--start-maximized"]
+    context = p.chromium.launch_persistent_context(
+        PROFILE_DIR,
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
     )
-    page = browser.new_page()
-    page.goto("https://example.com")
-    browser.close()
-```
-
----
-
-## ⚙️ Option 2: Wrapper Utility (Reusable Function)
-
-```python
-# utils/playwright_browser.py
-import os
-from playwright.sync_api import sync_playwright
-
-def get_browser():
-    USER_DATA_DIR = os.getenv("USER_DATA_DIR", "/app/user_data")
-    playwright = sync_playwright().start()
-    context = playwright.chromium.launch_persistent_context(
-        USER_DATA_DIR,
-        headless=False,
-        args=["--start-maximized"]
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
     )
-    return context
+    page = context.new_page()
+    page.goto("https://mail.google.com")
+    # your automation here
+    context.close()
 ```
 
-**Usage:**
-
-```python
-from utils.playwright_browser import get_browser
-
-browser = get_browser()
-page = browser.new_page()
-page.goto("https://example.com")
-browser.close()
-```
-
----
-
-## 🐒 Option 3: Monkey Patch launch() Globally
-
-```python
-from playwright.sync_api import sync_playwright
-import os
-
-def monkey_patch_launch(playwright):
-    USER_DATA_DIR = os.getenv("USER_DATA_DIR", "/app/user_data")
-
-    def _patched_launch(*args, **kwargs):
-        return playwright.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=kwargs.get("headless", True),
-            args=kwargs.get("args", [])
-        )
-
-    playwright.chromium.launch = _patched_launch
-    return playwright
-
-with sync_playwright() as p:
-    p = monkey_patch_launch(p)
-    browser = p.chromium.launch()  # Actually uses launch_persistent_context()
-    page = browser.new_page()
-    page.goto("https://example.com")
-    browser.close()
+Run it:
+```bash
+docker compose exec -e PERSONA=work playwright-vnc \
+    python3 /app/playwright-scripts/your_script.py
 ```
 
 ---
 
-## 🌀 Option 4: Async Version
+## Project Structure
 
-```python
-import os
-import asyncio
-from playwright.async_api import async_playwright
-
-async def main():
-    USER_DATA_DIR = os.getenv("USER_DATA_DIR", "/app/user_data")
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=False,
-            args=["--start-maximized"]
-        )
-        page = await browser.new_page()
-        await page.goto("https://example.com")
-        await browser.close()
-
-asyncio.run(main())
+```
+playwright_python_vnc/
+│
+├── docker-compose.yml          ← start/stop everything
+├── Dockerfile                  ← VNC+Playwright image
+├── .env                        ← local secrets (not committed)
+├── .env.example                ← template — copy to .env
+│
+├── container/                  ← baked into the Docker image
+│   ├── entry_point.sh          (starts Xvfb, VNC, Fluxbox)
+│   ├── run_browser.sh          (opens Chromium for manual login)
+│   └── scripts/
+│       └── open_persona.py     (Playwright session reuse helper)
+│
+├── manager/                    ← Persona Manager (FastAPI, live-mounted)
+│   ├── main.py
+│   ├── requirements.txt
+│   └── templates/index.html
+│
+├── profiles/                   ← Chrome profiles (host volume, persisted)
+│   ├── default/
+│   │   ├── persona.yml         ← metadata (committed)
+│   │   └── Default/            ← Chrome session data (committed for migration)
+│   └── example-persona/
+│       ├── persona.yml
+│       └── Default/
+│
+├── playwright-scripts/         ← your automation scripts (not committed)
+├── shared/                     ← file exchange host ↔ container
+├── AGENTS.md                   ← LLM/AI agent usage guide
+└── docs/
+    └── MIGRATION.md            ← moving to another machine
 ```
 
 ---
 
-## 📝 Notes
+## Backup & Restore
 
-- Requires Docker and a VNC client installed on your host.
-- Based on `mcr.microsoft.com/playwright/python:v1.51.0-noble`, with Python & Playwright pre-installed.
-- Includes system dependencies for headless + GUI operation.
-- Always use `launch_persistent_context()` if you want to retain cookies, sessions, logins, etc.
-- Use the `USER_DATA_DIR` environment variable to customize the directory outside your code logic (e.g., via Dockerfile).
-- **Modularized Shell Startup**: You can now run internal tools like `start_xvfb`, `start_vnc`, and `start_fluxbox` directly in the container shell.
-- Never use both `launch()` and `launch_persistent_context()` for the same purpose—they behave differently.
+```bash
+# Backup everything (profiles + config)
+tar -czf pyplayvnc_backup_$(date +%Y%m%d).tar.gz \
+  profiles/ manager/ container/ docker-compose.yml .env .env.example \
+  Dockerfile AGENTS.md README.md
+
+# Restore
+tar -xzf pyplayvnc_backup_20260714.tar.gz
+docker compose up -d
+```
+
+For full migration steps see **[docs/MIGRATION.md](./docs/MIGRATION.md)**.
 
 ---
 
-## 🎉 Final Thoughts
+## Services
 
-Enjoy seamless and visual browser automation with:
+| Service | Port | Description |
+|---|---|---|
+| `playwright-vnc` | 5900 | Xvfb + VNC + Chromium + Playwright runtime |
+| `manager` | 8888 | Persona Manager web UI + REST API |
 
-> 🐍 Python + 🎭 Playwright + 🖥️ VNC + 📦 Xvfb + 🎛️ Fluxbox
+```bash
+docker compose up -d            # start everything
+docker compose down             # stop (profiles preserved on host)
+docker compose logs -f manager  # watch manager logs
+docker compose restart manager  # restart after config change
+```
+
+---
+
+## Rebuild the Image
+
+Only needed when `Dockerfile` or `container/` files change. Profile data is never in the image.
+
+```bash
+docker build -t shashankrawlani/playwright_python_vnc:latest .
+docker compose up -d --force-recreate
+```
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DISPLAY` | `:99` | Xvfb display number |
+| `SCREEN_RES` | `1280x1024x24` | VNC screen resolution |
+| `PROFILES_ROOT` | `/app/profiles` | Multi-persona root directory |
+| `PERSONA` | `default` | Active persona for automation scripts |
+| `API_KEY_HASH` | — | SHA-256 hash of manager API key |
+| `VNC_CONTAINER` | `playwright_vnc` | Container name where Chrome runs |
+
+---
+
+## For AI Agents
+
+See **[AGENTS.md](./AGENTS.md)** — full API reference, isolation rules, docker exec usage,
+and rules for LLMs operating this system.

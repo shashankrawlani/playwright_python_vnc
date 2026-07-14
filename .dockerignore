@@ -1,44 +1,25 @@
-# Git
 .git
-.gitignore
-
-# Docs
-README.md
-docs/
-*.md
-
-# Environment
-.env.example
-
-# Playwright scripts — mounted or copied in at runtime as needed
+.github
+.env
+*.env
+!.env.example
+secrets/
+profiles/
+shared/
 playwright-scripts/
-
-# Python cache
 __pycache__/
 *.py[cod]
-*.pyo
+.pytest_cache/
 .venv/
 venv/
 env/
 *.egg-info/
 dist/
 build/
-
-# Chrome profiles — mounted as a volume at runtime, never baked into the image
-profiles/
-
-# Shared volume — mounted at runtime
-shared/
-
-# Logs
+playwright-report/
+test-results/
 *.log
 logs/
-
-# OS / Editor
 .DS_Store
-Thumbs.db
 .vscode/
 .idea/
-*.swp
-*.swo
-*~

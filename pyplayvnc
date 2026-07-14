@@ -1,120 +1,94 @@
 #!/usr/bin/env bash
-# pyplayvnc — container lifecycle helper
-#
-# Usage:
-#   pyplayvnc up          Start containers (idempotent)
-#   pyplayvnc down        Stop and remove containers (profiles preserved)
-#   pyplayvnc status      Show container state + persona status
-#   pyplayvnc open <name> Open browser for a persona (requires API key in env)
-#   pyplayvnc kill <name> Kill browser for a persona
-#   pyplayvnc logs        Tail manager logs
-#
-# Set PYPLAYVNC_KEY in your shell profile or pass inline:
-#   PYPLAYVNC_KEY=xxx pyplayvnc status
-
-set -euo pipefail
+set -Eeuo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOST="${PYPLAYVNC_HOST:-localhost}"
+HOST="${PYPLAYVNC_HOST:-127.0.0.1}"
 PORT="${PYPLAYVNC_PORT:-8888}"
 KEY="${PYPLAYVNC_KEY:-}"
 BASE="http://${HOST}:${PORT}"
 
-_api() {
-    local method="$1" path="$2"
-    shift 2
-    if [ -z "$KEY" ]; then
-        echo "Error: set PYPLAYVNC_KEY env var to your API key" >&2
-        exit 1
-    fi
-    curl -sf -X "$method" -H "X-API-Key: $KEY" "$@" "${BASE}${path}"
+validate_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "ERROR: invalid persona name" >&2; exit 2; }
 }
 
-cmd="${1:-help}"
+api() {
+  local method="$1" path="$2"
+  shift 2
+  [[ -n "$KEY" ]] || { echo "ERROR: set PYPLAYVNC_KEY" >&2; exit 1; }
+  curl --fail-with-body --silent --show-error --request "$method" \
+    --header "X-API-Key: ${KEY}" --header "Content-Type: application/json" \
+    "$@" "${BASE}${path}"
+}
 
-case "$cmd" in
-    up)
-        echo "▶  Starting PyPlayVNC..."
-        cd "$REPO_DIR"
-        docker compose up -d
-        echo ""
-        echo "✓  Manager UI: http://${HOST}:${PORT}"
-        echo "✓  VNC:        ${HOST}:5900  (use any VNC viewer)"
-        ;;
+case "${1:-help}" in
+  init)
+    cd "$REPO_DIR"
+    umask 077
+    mkdir -p secrets profiles shared
+    if [[ -e .env || -e secrets/vnc_password ]]; then
+      echo "ERROR: local secrets already exist; refusing to overwrite" >&2
+      exit 1
+    fi
+    read -r raw hash < <(python3 -c 'import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())')
+    vnc="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    printf 'API_KEY_HASH=%s\n' "$hash" > .env
+    printf '%s\n' "$vnc" > secrets/vnc_password
+    chmod 600 .env secrets/vnc_password
+    echo "Initialization complete. Save the following API key in your password manager; it will not be stored again:"
+    printf '%s\n' "$raw"
+    ;;
+  up)
+    cd "$REPO_DIR"
+    [[ -f .env && -f secrets/vnc_password ]] || { echo "ERROR: run 'pyplayvnc init' first" >&2; exit 1; }
+    docker compose up -d --build
+    echo "Manager: http://127.0.0.1:8888"
+    echo "VNC: 127.0.0.1:5900 (password is in local secrets/vnc_password)"
+    ;;
+  down)
+    cd "$REPO_DIR"
+    docker compose down
+    ;;
+  status)
+    docker ps --filter name=pyplayvnc --format '{{.Names}}  {{.Status}}'
+    echo
+    api GET /api/personas | python3 -c 'import json,sys
+for p in json.load(sys.stdin):
+ s="running" if p["browser_running"] else ("session" if p["has_session"] else "new")
+ print(f"{p[\"name\"]:<24} {s}")'
+    ;;
+  open)
+    name="${2:-default}"
+    url="${3:-https://example.com}"
+    validate_name "$name"
+    encoded="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$url")"
+    api POST "/api/personas/${name}/launch?url=${encoded}"
+    echo
+    echo "Connect to VNC through 127.0.0.1:5900 or an SSH tunnel."
+    ;;
+  kill)
+    name="${2:-default}"
+    validate_name "$name"
+    api POST "/api/personas/${name}/kill"
+    echo
+    ;;
+  logs)
+    cd "$REPO_DIR"
+    docker compose logs -f pyplayvnc
+    ;;
+  help|*)
+    cat <<'EOF'
+Usage: pyplayvnc <command>
 
-    down)
-        echo "■  Stopping PyPlayVNC (profiles preserved)..."
-        cd "$REPO_DIR"
-        docker compose down
-        echo "✓  Stopped"
-        ;;
+  init                    Generate local API/VNC secrets (one time)
+  up                      Build and start the secured service
+  down                    Stop it; local profiles remain
+  status                  Show service and persona status
+  open [persona] [url]    Launch a persona browser
+  kill [persona]          Stop a persona browser
+  logs                    Follow service logs
 
-    status)
-        echo "=== Containers ==="
-        docker ps --filter "name=playwright_vnc" --filter "name=persona_manager" \
-            --format "  {{.Names}}  {{.Status}}" 2>/dev/null || echo "  (not running)"
-        echo ""
-        echo "=== Personas ==="
-        _api GET /api/personas | python3 -c "
-import sys, json
-personas = json.load(sys.stdin)
-for p in personas:
-    status = '🟢 running' if p.get('browser_running') else ('✓ session' if p.get('has_session') else '○ no session')
-    print(f\"  {p['name']:<20} {status}\")
-" 2>/dev/null || echo "  (manager not ready)"
-        ;;
-
-    open)
-        name="${2:-default}"
-        url="${3:-https://mail.google.com}"
-        echo "▶  Opening browser for persona: $name"
-        result=$(_api POST "/api/personas/${name}/launch?url=${url}")
-        echo "$result" | python3 -c "
-import sys, json
-r = json.load(sys.stdin)
-print(f\"  Status: {r.get('status')}  PID: {r.get('pid')}\")
-print(f\"  Connect VNC: ${HOST}:5900\")
-"
-        ;;
-
-    kill)
-        name="${2:-default}"
-        echo "■  Killing browser for persona: $name"
-        _api POST "/api/personas/${name}/kill" | python3 -c "
-import sys, json
-r = json.load(sys.stdin)
-print(f\"  {r}\")
-"
-        ;;
-
-    logs)
-        cd "$REPO_DIR"
-        docker compose logs -f manager
-        ;;
-
-    *)
-        cat << 'HELP'
-pyplayvnc — persona browser manager
-
-Usage:
-  pyplayvnc up               Start containers
-  pyplayvnc down             Stop containers (profiles preserved)
-  pyplayvnc status           Show container + persona status
-  pyplayvnc open [name] [url]  Open browser for persona (default: default)
-  pyplayvnc kill [name]      Kill browser for persona
-  pyplayvnc logs             Tail manager logs
-
-Environment:
-  PYPLAYVNC_KEY    API key (required for open/kill/status)
-  PYPLAYVNC_HOST   Manager host (default: localhost)
-  PYPLAYVNC_PORT   Manager port (default: 8888)
-
-Examples:
-  pyplayvnc up
-  PYPLAYVNC_KEY=xxx pyplayvnc status
-  PYPLAYVNC_KEY=xxx pyplayvnc open default https://mail.google.com
-  PYPLAYVNC_KEY=xxx pyplayvnc kill default
-  pyplayvnc down
-HELP
-        ;;
+Set PYPLAYVNC_KEY to the raw API key printed by `pyplayvnc init`.
+Ports bind to loopback. Use SSH forwarding for remote access.
+EOF
+    ;;
 esac

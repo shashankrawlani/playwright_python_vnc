@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.lock
+      - name: Install locked test dependencies
+        run: python -m pip install --require-hashes -r tests/requirements.lock
+      - name: Unit tests
+        run: pytest -q
+      - name: Dependency audit
+        run: pip-audit -r manager/requirements.lock
+      - name: Shell syntax and static analysis
+        run: |
+          bash -n pyplayvnc container/entry_point.sh container/run_browser.sh
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt --entrypoint /bin/shellcheck \
+            koalaman/shellcheck-alpine@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002 \
+            pyplayvnc container/entry_point.sh container/run_browser.sh
+          docker run --rm -i \
+            hadolint/hadolint@sha256:7aba693c1442eb31c0b015c129697cb3b6cb7da589d85c7562f9deb435a6657c \
+            < Dockerfile
+      - name: Ensure private runtime data is not tracked
+        run: |
+          test -z "$(git ls-files profiles/ .env secrets/)"
+          ! git grep -nE 'COPY \.env|docker\.sock|seccomp:unconfined|--no-sandbox|localStorage|sessionStorage|allow_origins' -- . ':!.github/workflows/ci.yml'
+      - name: Compose validation
+        run: |
+          printf 'API_KEY_HASH=%064d\n' 0 > .env
+          mkdir -p secrets
+          printf 'ci-only-password\n' > secrets/vnc_password
+          docker compose config --quiet
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build hardened image
+        run: docker build --pull --tag pyplayvnc:ci .
+      - name: Inspect image defaults
+        run: |
+          test "$(docker image inspect pyplayvnc:ci --format '{{.Config.User}}')" = 'pyplayvnc:pyplayvnc'
+          test "$(docker run --rm --entrypoint sh pyplayvnc:ci -c 'test ! -e /app/.env && echo ok')" = 'ok'
+      - name: Scan image for fixed high and critical vulnerabilities
+        run: |
+          docker save -o /tmp/pyplayvnc-ci.tar pyplayvnc:ci
+          docker run --rm -v /tmp:/scan \
+            aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --input /scan/pyplayvnc-ci.tar --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 --no-progress

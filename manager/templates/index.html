@@ -259,10 +259,10 @@
 
 <main>
   <div class="toolbar">
-    <button class="btn-primary" onclick="openCreateModal()">＋ New Persona</button>
+    <button class="btn-primary" id="newPersonaBtn">＋ New Persona</button>
     <div class="toolbar-right">
-      <button class="btn-ghost" onclick="loadPersonas()" title="Refresh">⟳ Refresh</button>
-      <button class="btn-ghost" onclick="resetKey()" title="Change API key">🔑 Key</button>
+      <button class="btn-ghost" id="refreshBtn" title="Refresh">⟳ Refresh</button>
+      <button class="btn-ghost" id="resetKeyBtn" title="Change API key">🔑 Key</button>
     </div>
   </div>
 
@@ -270,24 +270,24 @@
 </main>
 
 <!-- ── Create / Edit Modal ── -->
-<div id="modalOverlay" class="overlay" onclick="closeModal(event)">
-  <div class="modal" onclick="event.stopPropagation()">
+<div id="modalOverlay" class="overlay">
+  <div class="modal">
     <h2 id="modalTitle">New Persona</h2>
 
     <div class="form-group">
       <label>Name <span style="color:var(--muted)">(alphanumeric, hyphens, underscores)</span></label>
-      <input id="f_name" placeholder="e.g. work-gmail" />
+      <input id="f_name" placeholder="e.g. personal" />
     </div>
 
     <div class="form-group">
       <label>Description</label>
-      <input id="f_desc" placeholder="e.g. Work Gmail account" />
+      <input id="f_desc" placeholder="e.g. Personal browser profile" />
     </div>
 
     <div class="form-group">
       <label>Accounts</label>
       <div id="accountsContainer"></div>
-      <button class="btn-ghost btn-sm" style="margin-top:6px" onclick="addAccountRow()">＋ Add Account</button>
+      <button class="btn-ghost btn-sm" style="margin-top:6px" id="addAccountBtn">＋ Add Account</button>
     </div>
 
     <div class="form-group">
@@ -296,27 +296,27 @@
     </div>
 
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
-      <button class="btn-ghost" onclick="closeModal()">Cancel</button>
-      <button class="btn-primary" id="modalSaveBtn" onclick="savePersona()">Save</button>
+      <button class="btn-ghost" id="cancelPersonaBtn">Cancel</button>
+      <button class="btn-primary" id="modalSaveBtn">Save</button>
     </div>
   </div>
 </div>
 
 <!-- ── Launch Modal ── -->
-<div id="launchOverlay" class="overlay" onclick="closeLaunchModal(event)">
-  <div class="modal" onclick="event.stopPropagation()">
+<div id="launchOverlay" class="overlay">
+  <div class="modal">
     <h2>Launch Browser</h2>
     <p style="color:var(--muted);font-size:13px;line-height:1.6">
-      Opens raw Chromium (no automation flags) in the VNC session so you can
-      login manually. Connect to <strong>homelab:5900</strong> via VNC to see it.
+Opens Chromium in the VNC session for manual use. Connect through the
+locally bound VNC port or an authenticated SSH tunnel.
     </p>
     <div class="form-group">
       <label>Starting URL</label>
-      <input id="launchUrl" value="https://mail.google.com" />
+      <input id="launchUrl" value="https://example.com" />
     </div>
     <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:4px">
-      <button class="btn-ghost" onclick="closeLaunchModal()">Cancel</button>
-      <button class="btn-success" id="launchConfirmBtn" onclick="confirmLaunch()">🚀 Launch</button>
+      <button class="btn-ghost" id="cancelLaunchBtn">Cancel</button>
+      <button class="btn-success" id="launchConfirmBtn">🚀 Launch</button>
     </div>
   </div>
 </div>
@@ -324,324 +324,7 @@
 <!-- ── Toast ── -->
 <div id="toast"></div>
 
-<script>
-// ─────────────────────────────────────────────
-// State
-// ─────────────────────────────────────────────
-let personas = [];
-let editingName = null;   // null = create mode, string = edit mode
-let launchingName = null;
+<script src="/static/app.js" defer></script>
 
-// ─────────────────────────────────────────────
-// API Key — stored in localStorage (cleared on tab close)
-// ─────────────────────────────────────────────
-function getApiKey() {
-  return localStorage.getItem('pyplayvnc_api_key') || '';
-}
-
-function promptForKey() {
-  const key = prompt('Enter your PyPlayVNC API key:');
-  if (key) {
-    localStorage.setItem('pyplayvnc_api_key', key.trim());
-    return key.trim();
-  }
-  return '';
-}
-
-// ─────────────────────────────────────────────
-// API helpers
-// ─────────────────────────────────────────────
-const API = '';  // same origin
-
-async function api(method, path, body) {
-  let key = getApiKey();
-  const opts = {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-API-Key': key,
-    }
-  };
-  if (body !== undefined) opts.body = JSON.stringify(body);
-  const r = await fetch(API + path, opts);
-  if (r.status === 401 || r.status === 403) {
-    // Key missing or wrong — prompt and retry once
-    localStorage.removeItem('pyplayvnc_api_key');
-    key = promptForKey();
-    if (!key) throw new Error('API key required');
-    opts.headers['X-API-Key'] = key;
-    const r2 = await fetch(API + path, opts);
-    if (!r2.ok) {
-      const d = await r2.json().catch(() => ({}));
-      throw new Error(d.detail || r2.statusText);
-    }
-    if (r2.status === 204) return null;
-    return r2.json();
-  }
-  if (r.status === 204) return null;
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.detail || r.statusText);
-  return data;
-}
-
-// ─────────────────────────────────────────────
-// Load & render
-// ─────────────────────────────────────────────
-async function loadPersonas() {
-  try {
-    personas = await api('GET', '/api/personas');
-    render();
-    document.getElementById('headerStatus').textContent =
-      `${personas.length} persona${personas.length !== 1 ? 's' : ''} · ${new Date().toLocaleTimeString()}`;
-  } catch(e) {
-    toast('Failed to load: ' + e.message, 'err');
-  }
-}
-
-function render() {
-  const grid = document.getElementById('grid');
-  if (!personas.length) {
-    grid.innerHTML = `<div class="empty" style="grid-column:1/-1">
-      <div class="icon">🎭</div>
-      <div>No personas yet. Click <strong>+ New Persona</strong> to get started.</div>
-    </div>`;
-    return;
-  }
-  grid.innerHTML = personas.map(p => cardHtml(p)).join('');
-}
-
-function cardHtml(p) {
-  const running = p.browser_running;
-  const session = p.has_session;
-  const statusBadge = running
-    ? `<span class="badge badge-active">● Running</span>`
-    : session
-      ? `<span class="badge badge-session">✓ Session saved</span>`
-      : `<span class="badge badge-idle">○ No session</span>`;
-
-  const accounts = p.meta.accounts.length
-    ? `<div class="accounts">${p.meta.accounts.map(a =>
-        `<span class="account-tag">🌐 <strong>${a.site}</strong> ${a.email}</span>`
-      ).join('')}</div>`
-    : '';
-
-  const notes = p.meta.notes
-    ? `<div class="notes-text">${escHtml(p.meta.notes)}</div>` : '';
-
-  const launchBtn = running
-    ? `<button class="btn-warn btn-sm" onclick="killBrowser('${p.name}')">⏹ Stop Browser</button>`
-    : `<button class="btn-success btn-sm" onclick="openLaunchModal('${p.name}')">▶ Open Browser</button>`;
-
-  return `
-    <div class="card ${running ? 'running' : ''}" id="card-${p.name}">
-      <div class="card-header">
-        <div>
-          <div class="card-name">${escHtml(p.name)}</div>
-          ${statusBadge}
-        </div>
-      </div>
-      ${p.meta.description ? `<div class="card-desc">${escHtml(p.meta.description)}</div>` : ''}
-      ${accounts}
-      ${notes}
-      <div class="card-actions">
-        ${launchBtn}
-        <button class="btn-ghost btn-sm" onclick="openEditModal('${p.name}')">✎ Edit</button>
-        <button class="btn-danger btn-sm" onclick="deletePersona('${p.name}')">🗑</button>
-      </div>
-    </div>`;
-}
-
-// ─────────────────────────────────────────────
-// Create / Edit Modal
-// ─────────────────────────────────────────────
-function openCreateModal() {
-  editingName = null;
-  document.getElementById('modalTitle').textContent = 'New Persona';
-  document.getElementById('f_name').value = '';
-  document.getElementById('f_name').disabled = false;
-  document.getElementById('f_desc').value = '';
-  document.getElementById('f_notes').value = '';
-  document.getElementById('accountsContainer').innerHTML = '';
-  document.getElementById('modalSaveBtn').textContent = 'Create';
-  document.getElementById('modalOverlay').classList.add('open');
-  document.getElementById('f_name').focus();
-}
-
-function openEditModal(name) {
-  const p = personas.find(x => x.name === name);
-  if (!p) return;
-  editingName = name;
-  document.getElementById('modalTitle').textContent = `Edit · ${name}`;
-  document.getElementById('f_name').value = name;
-  document.getElementById('f_name').disabled = true;
-  document.getElementById('f_desc').value = p.meta.description || '';
-  document.getElementById('f_notes').value = p.meta.notes || '';
-  document.getElementById('accountsContainer').innerHTML = '';
-  (p.meta.accounts || []).forEach(a => addAccountRow(a.site, a.email));
-  document.getElementById('modalSaveBtn').textContent = 'Save Changes';
-  document.getElementById('modalOverlay').classList.add('open');
-  document.getElementById('f_desc').focus();
-}
-
-function closeModal(e) {
-  if (e && e.target !== document.getElementById('modalOverlay')) return;
-  document.getElementById('modalOverlay').classList.remove('open');
-}
-
-function addAccountRow(site = '', email = '') {
-  const container = document.getElementById('accountsContainer');
-  const row = document.createElement('div');
-  row.className = 'account-row';
-  row.style.marginBottom = '6px';
-  row.innerHTML = `
-    <div class="form-group" style="margin:0">
-      <label>Site</label>
-      <input class="acc-site" placeholder="gmail.com" value="${escHtml(site)}" />
-    </div>
-    <div class="form-group" style="margin:0">
-      <label>Email</label>
-      <input class="acc-email" placeholder="[REMOVED]" value="${escHtml(email)}" />
-    </div>
-    <button class="btn-danger btn-sm" style="margin-top:18px" onclick="this.closest('.account-row').remove()">✕</button>`;
-  container.appendChild(row);
-}
-
-async function savePersona() {
-  const name = document.getElementById('f_name').value.trim();
-  const description = document.getElementById('f_desc').value.trim();
-  const notes = document.getElementById('f_notes').value.trim();
-  const accounts = [...document.querySelectorAll('.account-row')].map(row => ({
-    site:  row.querySelector('.acc-site').value.trim(),
-    email: row.querySelector('.acc-email').value.trim(),
-  })).filter(a => a.site && a.email);
-
-  if (!name) { toast('Name is required', 'err'); return; }
-  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
-    toast('Name: only letters, numbers, hyphens, underscores', 'err'); return;
-  }
-
-  const btn = document.getElementById('modalSaveBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin">⟳</span> Saving…';
-
-  try {
-    if (editingName) {
-      await api('PUT', `/api/personas/${editingName}`, { description, accounts, notes });
-      toast(`Updated ${editingName}`, 'ok');
-    } else {
-      await api('POST', '/api/personas', { name, description, accounts, notes });
-      toast(`Created ${name}`, 'ok');
-    }
-    document.getElementById('modalOverlay').classList.remove('open');
-    await loadPersonas();
-  } catch(e) {
-    toast(e.message, 'err');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = editingName ? 'Save Changes' : 'Create';
-  }
-}
-
-// ─────────────────────────────────────────────
-// Delete
-// ─────────────────────────────────────────────
-async function deletePersona(name) {
-  if (!confirm(`Delete persona "${name}"?\nThis will permanently remove all Chrome profile data.`)) return;
-  try {
-    await api('DELETE', `/api/personas/${name}`);
-    toast(`Deleted ${name}`, 'ok');
-    await loadPersonas();
-  } catch(e) {
-    toast(e.message, 'err');
-  }
-}
-
-// ─────────────────────────────────────────────
-// Browser control
-// ─────────────────────────────────────────────
-function openLaunchModal(name) {
-  launchingName = name;
-  document.getElementById('launchUrl').value = 'https://mail.google.com';
-  document.getElementById('launchOverlay').classList.add('open');
-  document.getElementById('launchUrl').focus();
-}
-
-function closeLaunchModal(e) {
-  if (e && e.target !== document.getElementById('launchOverlay')) return;
-  document.getElementById('launchOverlay').classList.remove('open');
-}
-
-async function confirmLaunch() {
-  const url = document.getElementById('launchUrl').value.trim() || 'https://mail.google.com';
-  const btn = document.getElementById('launchConfirmBtn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin">⟳</span> Launching…';
-  try {
-    const r = await api('POST', `/api/personas/${launchingName}/launch?url=${encodeURIComponent(url)}`);
-    toast(`Browser launched for ${launchingName} (PID ${r.pid}) — check VNC :5900`, 'ok');
-    document.getElementById('launchOverlay').classList.remove('open');
-    await loadPersonas();
-  } catch(e) {
-    toast(e.message, 'err');
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = '🚀 Launch';
-  }
-}
-
-async function killBrowser(name) {
-  try {
-    await api('POST', `/api/personas/${name}/kill`);
-    toast(`Browser stopped for ${name}`, 'ok');
-    await loadPersonas();
-  } catch(e) {
-    toast(e.message, 'err');
-  }
-}
-
-// ─────────────────────────────────────────────
-// Toast
-// ─────────────────────────────────────────────
-let toastTimer;
-function toast(msg, type = 'ok') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = `show ${type}`;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
-}
-
-// ─────────────────────────────────────────────
-// Util
-// ─────────────────────────────────────────────
-function escHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-// ─────────────────────────────────────────────
-// Keyboard shortcuts
-// ─────────────────────────────────────────────
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    document.getElementById('modalOverlay').classList.remove('open');
-    document.getElementById('launchOverlay').classList.remove('open');
-  }
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') savePersona();
-});
-
-function resetKey() {
-  localStorage.removeItem('pyplayvnc_api_key');
-  promptForKey();
-  loadPersonas();
-}
-
-// ─────────────────────────────────────────────
-// Init + Auto-refresh every 10s
-// ─────────────────────────────────────────────
-// Prompt for key on first load if not set
-if (!getApiKey()) promptForKey();
-loadPersonas();
-setInterval(loadPersonas, 10000);
-</script>
 </body>
 </html>

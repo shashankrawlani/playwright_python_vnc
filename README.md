@@ -1,313 +1,147 @@
 # PyPlayVNC
 
-Dockerized persistent Chrome browser automation with multi-persona profile management,
-VNC access, and a REST API + web UI for control.
+A local-only, Dockerized Playwright/Chromium environment with persistent, isolated browser personas, a VNC display, and a small authenticated management API.
 
-**Stack:** Python 3.12 · Playwright 1.61.0 · Chromium 149 · Xvfb · x11vnc · Fluxbox · FastAPI
+## Security model
 
----
+- The manager and VNC ports bind to `127.0.0.1` by default.
+- VNC requires a password stored in `secrets/vnc_password`.
+- Every persona API route requires an API key; the service refuses to start without a valid SHA-256 verifier.
+- The raw API key is kept only in memory by the web UI and is never stored in browser storage.
+- Runtime Chrome profiles, `.env`, secrets, shared files, and user automation scripts are excluded from Git and Docker build contexts.
+- The service runs as an unprivileged user with all Linux capabilities dropped, the default seccomp profile, `no-new-privileges`, and a read-only root filesystem.
+- The Docker socket is not mounted.
 
-## What It Does
+This is a local administration tool, not an Internet-facing service. Use SSH forwarding for remote access.
 
-- Runs persistent Chrome sessions called **personas** inside Docker
-- Each persona has its own isolated Chrome profile — separate cookies, logins, history
-- VNC access (port 5900) lets you see and interact with the browser visually
-- Persona Manager (port 8888) lets you create, launch, and control personas via web UI or REST API
-- Playwright automation scripts reuse saved login sessions without triggering bot detection
-- Profiles are stored on the host — portable, easy to back up and migrate
+## Components
 
----
+- Python 3.12 and Playwright 1.61.0
+- Playwright Chrome for Testing 149
+- Xvfb, Fluxbox, and password-protected x11vnc
+- FastAPI persona manager
+- Persistent host-mounted profiles
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│  Host machine                                   │
-│                                                 │
-│  ./profiles/          ← Chrome profiles (host   │
-│    default/           ←   volume, persisted)    │
-│    example-persona/                            │
-│                                                 │
-│  ┌──────────────────────────────────────────┐   │
-│  │  playwright_vnc container                │   │
-│  │                                          │   │
-│  │  Xvfb :99  ←  x11vnc → port 5900 (VNC)  │   │
-│  │  Fluxbox                                 │   │
-│  │  Chrome (launched via docker exec)       │   │
-│  │                                          │   │
-│  │  port 8888 ──────────────────────────┐   │   │
-│  └──────────────────────────────────────┼───┘   │
-│                                         │       │
-│  ┌──────────────────────────────────────┼───┐   │
-│  │  persona_manager container           │   │   │
-│  │  (shares network namespace)          │   │   │
-│  │                                      │   │   │
-│  │  FastAPI on :8080 ───────────────────┘   │   │
-│  │  Uses docker exec to launch Chrome       │   │
-│  │  inside playwright_vnc (MIT-SHM fix)     │   │
-│  └──────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────┘
-```
-
-**Why `docker exec`?** Chrome uses X11 MIT-SHM (shared memory) for rendering. If Chrome
-runs in a different container than Xvfb, the shared memory segment can't be accessed and
-the screen stays blank. Chrome must run inside `playwright_vnc` to share its memory space.
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
-git clone https://github.com/shashankrawlani/playwright_python_vnc
+git clone https://github.com/OWNER/playwright_python_vnc.git
 cd playwright_python_vnc
-cp .env.example .env
-# Edit .env — generate and add API_KEY_HASH (see Auth section)
-docker compose up -d
+chmod +x pyplayvnc
+./pyplayvnc init
 ```
 
-**Access:**
-- Persona Manager UI: `http://localhost:8888`
-- VNC (live browser): `localhost:5900` — connect with any VNC viewer (no password)
-- API docs (Swagger): `http://localhost:8888/docs`
-
----
-
-## Auth Setup
-
-The manager API requires an API key. Only the SHA-256 hash is stored in `.env`.
+`init` prints a high-entropy API key once. Save it in a password manager. It stores only the SHA-256 verifier in `.env` and writes a separate VNC password to the ignored `secrets/` directory.
 
 ```bash
-python3 -c "
-import secrets, hashlib
-k = secrets.token_urlsafe(32)
-print('RAW  (save to password manager):', k)
-print('HASH (put in .env):', hashlib.sha256(k.encode()).hexdigest())
-"
+export PYPLAYVNC_KEY='<raw API key from init>'
+./pyplayvnc up
+./pyplayvnc status
 ```
 
-Add to `.env`:
-```
-API_KEY_HASH=<the-hash-output>
-```
+Access locally:
 
-Store the **raw key** in your password manager. Never put it in `.env` or commit it.
+- Manager: `http://127.0.0.1:8888`
+- VNC: `127.0.0.1:5900` using the local password in `secrets/vnc_password`
 
----
-
-## Current Personas
-
-| Name | Purpose |
-|---|---|
-| `default` | Primary persona — see `profiles/default/persona.yml` |
-| `example-persona` | Logistics account — see `profiles/example-persona/persona.yml` |
-
----
-
-## Persona Workflow
-
-### 1 — Create a persona
-
-Via UI: `http://localhost:8888` → **+ New Persona**
-
-Via API:
-```bash
-curl -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
-  http://localhost:8888/api/personas \
-  -d '{"name":"work","description":"Work Gmail","accounts":[{"site":"gmail.com","email":"[REMOVED]"}]}'
-```
-
-### 2 — Login manually via VNC (once per persona)
+For remote access, tunnel both loopback ports:
 
 ```bash
-curl -X POST -H "X-API-Key: $KEY" \
-  "http://localhost:8888/api/personas/work/launch?url=https://mail.google.com"
+ssh -L 8888:127.0.0.1:8888 -L 5900:127.0.0.1:5900 user@host
 ```
 
-Connect to `localhost:5900` in your VNC viewer → complete login → close the browser.
-The session is saved to `profiles/work/`. You never need to repeat this.
+Do not publish either port directly.
 
-### 3 — Automate with Playwright
+## Personas
+
+Runtime personas live under ignored `profiles/<name>/` directories. The API accepts only 1–64 ASCII letters, digits, underscores, and hyphens. Every browser entry point uses a shared advisory lock so one profile cannot be opened concurrently.
+
+Create through the UI or API:
 
 ```bash
-# Headless (no visible browser)
-docker compose exec -e PERSONA=work playwright-vnc \
-    python3 /app/scripts/open_persona.py --url https://mail.google.com --headless
-
-# Visible in VNC
-docker compose exec -e PERSONA=work playwright-vnc \
-    python3 /app/scripts/open_persona.py --url https://mail.google.com
+curl --fail-with-body \
+  -H "X-API-Key: $PYPLAYVNC_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"example","description":"Local example","accounts":[],"notes":""}' \
+  http://127.0.0.1:8888/api/personas
 ```
 
----
-
-## Persona Isolation
-
-Each persona is completely isolated:
-
-- Separate Chrome profile directory — no shared cookies, storage, or history
-- The `PERSONA` environment variable selects which profile is used
-- Scripts running with `PERSONA=work` never touch `PERSONA=default`
-- Two personas can NOT run simultaneously against the same profile directory
-
-**Never:**
-- Open the same persona in two browser instances at the same time
-- Expose or log the contents of `profiles/<name>/Default/Cookies`
-
----
-
-## REST API
-
-All endpoints require `X-API-Key: <raw-key>` header.
-Full interactive docs: `http://localhost:8888/docs`
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/personas` | List all personas + status |
-| GET | `/api/personas/{name}` | Get one persona |
-| POST | `/api/personas` | Create persona |
-| PUT | `/api/personas/{name}` | Update metadata |
-| DELETE | `/api/personas/{name}` | Delete persona + all data |
-| POST | `/api/personas/{name}/launch` | Open browser for manual login |
-| POST | `/api/personas/{name}/kill` | Kill running browser |
-| GET | `/api/personas/{name}/status` | Running? Session saved? |
-
----
-
-## Writing Automation Scripts
-
-Place scripts in `playwright-scripts/` (not committed):
-
-```python
-from playwright.sync_api import sync_playwright
-import os
-
-PERSONA = os.getenv("PERSONA", "default")
-PROFILE_DIR = f"/app/profiles/{PERSONA}"
-
-with sync_playwright() as p:
-    context = p.chromium.launch_persistent_context(
-        PROFILE_DIR,
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
-    )
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
-    page = context.new_page()
-    page.goto("https://mail.google.com")
-    # your automation here
-    context.close()
-```
-
-Run it:
-```bash
-docker compose exec -e PERSONA=work playwright-vnc \
-    python3 /app/playwright-scripts/your_script.py
-```
-
----
-
-## Project Structure
-
-```
-playwright_python_vnc/
-│
-├── docker-compose.yml          ← start/stop everything
-├── Dockerfile                  ← VNC+Playwright image
-├── .env                        ← local secrets (not committed)
-├── .env.example                ← template — copy to .env
-│
-├── container/                  ← baked into the Docker image
-│   ├── entry_point.sh          (starts Xvfb, VNC, Fluxbox)
-│   ├── run_browser.sh          (opens Chromium for manual login)
-│   └── scripts/
-│       └── open_persona.py     (Playwright session reuse helper)
-│
-├── manager/                    ← Persona Manager (FastAPI, live-mounted)
-│   ├── main.py
-│   ├── requirements.txt
-│   └── templates/index.html
-│
-├── profiles/                   ← Chrome profiles (host volume, persisted)
-│   ├── default/
-│   │   ├── persona.yml         ← metadata (committed)
-│   │   └── Default/            ← Chrome session data (committed for migration)
-│   └── example-persona/
-│       ├── persona.yml
-│       └── Default/
-│
-├── playwright-scripts/         ← your automation scripts (not committed)
-├── shared/                     ← file exchange host ↔ container
-├── AGENTS.md                   ← LLM/AI agent usage guide
-└── docs/
-    └── MIGRATION.md            ← moving to another machine
-```
-
----
-
-## Backup & Restore
+Open it for manual use:
 
 ```bash
-# Backup everything (profiles + config)
-tar -czf pyplayvnc_backup_$(date +%Y%m%d).tar.gz \
-  profiles/ manager/ container/ docker-compose.yml .env .env.example \
-  Dockerfile AGENTS.md README.md
-
-# Restore
-tar -xzf pyplayvnc_backup_20260714.tar.gz
-docker compose up -d
+./pyplayvnc open example https://example.com
+# Connect via VNC, then stop it when finished:
+./pyplayvnc kill example
 ```
 
-For full migration steps see **[docs/MIGRATION.md](./docs/MIGRATION.md)**.
+Authentication to third-party websites is always a manual user action. PyPlayVNC does not guarantee that a website will accept a containerized browser and does not claim to bypass bot detection.
 
----
+## Playwright automation
 
-## Services
-
-| Service | Port | Description |
-|---|---|---|
-| `playwright-vnc` | 5900 | Xvfb + VNC + Chromium + Playwright runtime |
-| `manager` | 8888 | Persona Manager web UI + REST API |
+After creating a persona and, if needed, authenticating manually:
 
 ```bash
-docker compose up -d            # start everything
-docker compose down             # stop (profiles preserved on host)
-docker compose logs -f manager  # watch manager logs
-docker compose restart manager  # restart after config change
+docker compose exec -e PERSONA=example pyplayvnc \
+  python3 /app/scripts/open_persona.py --url https://example.com --headless
 ```
 
----
+Custom scripts should stay in the ignored `playwright-scripts/` directory or another private project. Never print cookies, tokens, profile database contents, or API keys.
 
-## Rebuild the Image
-
-Only needed when `Dockerfile` or `container/` files change. Profile data is never in the image.
+## Lifecycle
 
 ```bash
-docker build -t shashankrawlani/playwright_python_vnc:latest .
-docker compose up -d --force-recreate
+./pyplayvnc up
+./pyplayvnc status
+./pyplayvnc logs
+./pyplayvnc down
 ```
 
----
+Stopping/removing the container does not delete host-mounted profiles. Deleting a persona through the API permanently removes that persona's local directory after its browser is stopped.
 
-## Environment Variables
+## Local profile permissions
 
-| Variable | Default | Description |
-|---|---|---|
-| `DISPLAY` | `:99` | Xvfb display number |
-| `SCREEN_RES` | `1280x1024x24` | VNC screen resolution |
-| `PROFILES_ROOT` | `/app/profiles` | Multi-persona root directory |
-| `PERSONA` | `default` | Active persona for automation scripts |
-| `API_KEY_HASH` | — | SHA-256 hash of manager API key |
-| `VNC_CONTAINER` | `playwright_vnc` | Container name where Chrome runs |
+The image defaults to UID/GID 1000. `pyplayvnc init` records the current user's UID/GID in `.env`. If upgrading from an older root-running image, stop all containers and fix ownership once:
 
----
+```bash
+sudo chown -R "$(id -u):$(id -g)" profiles shared
+chmod 700 profiles shared
+```
 
-## For AI Agents
+## Migration and history safety
 
-See **[AGENTS.md](./AGENTS.md)** — full API reference, isolation rules, docker exec usage,
-and rules for LLMs operating this system.
+- [Safe migration](docs/MIGRATION.md)
+- [History remediation](docs/HISTORY_REMEDIATION.md)
+
+Never commit `profiles/`. Chrome profile files contain live credentials. `git ls-files profiles/` must return no output before any push.
+
+## Dependency and image policy
+
+- The Playwright base image is pinned by tag and digest.
+- Python dependencies are pinned with hashes in `manager/requirements.lock`.
+- Compose builds the checked-out source instead of silently relying on a stale `latest` image.
+- Release automation should publish immutable version and commit-SHA tags; `latest` is not a deployment pin.
+
+Regenerate dependencies only after review:
+
+```bash
+pip-compile --strip-extras --generate-hashes \
+  --output-file=manager/requirements.lock manager/requirements.in
+pip-audit -r manager/requirements.lock
+```
+
+## Development checks
+
+```bash
+python3 -m pytest -q
+bash -n pyplayvnc container/*.sh
+docker compose config --quiet
+docker compose build --pull
+```
+
+## Public-release checklist
+
+1. `git ls-files profiles/ .env secrets/` returns nothing.
+2. Secret and history scans pass.
+3. Tests and image smoke tests pass.
+4. Published image digest and package versions match the release.
+5. Historical PII has been removed from every ref before public visibility is enabled.

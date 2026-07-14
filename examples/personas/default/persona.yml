@@ -1,0 +1,4 @@
+name: default
+description: "Example persona"
+accounts: []
+notes: "Copy this file to profiles/default/persona.yml locally; never commit runtime profiles."

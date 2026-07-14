@@ -1,85 +1,47 @@
-#!/bin/bash
-# ─────────────────────────────────────────────────────────────
-# run_browser.sh — Open Chromium for a persona (manual login)
-#
-# Usage (from host):
-#   docker compose exec playwright-vnc /app/run_browser.sh
-#   docker compose exec -e PERSONA=persona1 playwright-vnc /app/run_browser.sh
-#
-# Or directly inside container shell:
-#   PERSONA=persona1 /app/run_browser.sh
-#   /app/run_browser.sh gmail.com          # opens a URL directly
-#
-# The browser is NOT launched via Playwright, so Google/other sites
-# cannot detect automation. Login manually via VNC, then close the
-# browser — your session is saved to the profile directory.
-# ─────────────────────────────────────────────────────────────
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
 PERSONA="${PERSONA:-default}"
-PROFILE_DIR="/app/profiles/${PERSONA}"
-CHROMIUM_BIN="$(find /ms-playwright -name 'chrome' | grep -v firefox | head -1)"
-URL="${1:-about:newtab}"
+PROFILES_ROOT="${PROFILES_ROOT:-/app/profiles}"
+LOCK_ROOT="${LOCK_ROOT:-/tmp/pyplayvnc-locks}"
+URL="${1:-https://example.com}"
 
-# ── Validate ──────────────────────────────────────────────────
-if [ -z "$CHROMIUM_BIN" ]; then
-    echo "❌ Chromium binary not found in /ms-playwright"
-    exit 1
+if [[ ! "$PERSONA" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+  echo "ERROR: invalid persona name" >&2
+  exit 2
+fi
+if [[ ! "$URL" =~ ^https?:// ]]; then
+  echo "ERROR: only absolute HTTP(S) URLs are allowed" >&2
+  exit 2
 fi
 
-if [ ! -d "$PROFILE_DIR" ]; then
-    echo "⚠️  Profile directory not found: $PROFILE_DIR"
-    echo "   Creating it now..."
-    mkdir -p "$PROFILE_DIR"
+PROFILE_DIR="${PROFILES_ROOT}/${PERSONA}"
+mkdir -p "$PROFILE_DIR" "$LOCK_ROOT"
+chmod 0700 "$PROFILE_DIR" "$LOCK_ROOT"
+
+CHROMIUM_BIN="${CHROMIUM_BIN:-}"
+if [[ -z "$CHROMIUM_BIN" ]]; then
+  CHROMIUM_BIN="$(find /ms-playwright -type f -path '*/chrome-linux64/chrome' -print -quit)"
+fi
+if [[ -z "$CHROMIUM_BIN" || ! -x "$CHROMIUM_BIN" ]]; then
+  echo "ERROR: Chromium executable not found" >&2
+  exit 1
 fi
 
-# ── Clean up stale Chrome lock files ─────────────────────────
-# Chrome leaves these behind after crashes or unclean container stops.
-# Safe to remove — Chrome recreates them on startup.
-echo "🧹 Clearing any stale Chrome lock files..."
-rm -f \
-    "$PROFILE_DIR/SingletonLock" \
-    "$PROFILE_DIR/SingletonCookie" \
-    "$PROFILE_DIR/SingletonSocket"
-# Also clear database journal/lock files if present
-DEFAULT_DIR="$PROFILE_DIR/Default"
-if [ -d "$DEFAULT_DIR" ]; then
-    rm -f "$DEFAULT_DIR/Login Data-journal" \
-          "$DEFAULT_DIR/History-journal" \
-          "$DEFAULT_DIR/Favicons-journal" \
-          "$DEFAULT_DIR/Web Data-journal" \
-          "$DEFAULT_DIR/Shortcuts-journal" \
-          "$DEFAULT_DIR/Login Data-shm" \
-          "$DEFAULT_DIR/Login Data-wal"
-    find "$DEFAULT_DIR/Local Storage" -name "LOCK" -delete 2>/dev/null || true
-    find "$DEFAULT_DIR/IndexedDB"     -name "LOCK" -delete 2>/dev/null || true
+exec 9>"${LOCK_ROOT}/${PERSONA}.lock"
+if ! flock -n 9; then
+  echo "ERROR: persona is already in use" >&2
+  exit 3
 fi
 
-# ── Launch ────────────────────────────────────────────────────
-echo ""
-echo "🧑 Persona     : $PERSONA"
-echo "📂 Profile dir : $PROFILE_DIR"
-echo "🌐 Opening URL : $URL"
-echo "🖥️  Connect VNC  : localhost:5900"
-echo ""
-echo "👉 Login manually in the browser window, then close it."
-echo "   Your session will be saved and reused by Playwright scripts."
-echo ""
+for lock in SingletonLock SingletonCookie SingletonSocket; do
+  rm -f -- "${PROFILE_DIR}/${lock}"
+done
 
 exec "$CHROMIUM_BIN" \
-    --no-sandbox \
-    --disable-setuid-sandbox \
-    --disable-gpu-sandbox \
-    --user-data-dir="$PROFILE_DIR" \
-    --disable-blink-features=AutomationControlled \
-    --disable-infobars \
-    --disable-dev-shm-usage \
-    --disable-gpu \
-    --disable-software-rasterizer \
-    --disable-gpu-compositing \
-    --in-process-gpu \
-    --password-store=basic \
-    --no-first-run \
-    --no-default-browser-check \
-    --start-maximized \
-    "$URL"
+  --user-data-dir="$PROFILE_DIR" \
+  --password-store=basic \
+  --no-first-run \
+  --no-default-browser-check \
+  --start-maximized \
+  "$URL"

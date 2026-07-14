@@ -1,140 +1,59 @@
-#!/bin/bash
-set -euo pipefail
-# ┌────────────────────────────────────────────────────────┐
-# │ PyPlayVNC - GhostBrowser for entrypoint.sh 🚀         │
-# └────────────────────────────────────────────────────────┘
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-cat <<'EOF'
- ____        ____  _           __     ___   _  ____              
-|  _ \ _   _|  _ \| | __ _ _   \ \   / / \ | |/ ___|             
-| |_) | | | | |_) | |/ _` | | | \ \ / /|  \| | |      _____      
-|  __/| |_| |  __/| | (_| | |_| |\ V / | |\  | |___  |_____|     
-|_|    \__, |_|   |_|\__,_|\__, | \_/  |_| \_|\____|             
-  ____ |___/           _   |___/                                 
- / ___| |__   ___  ___| |_| __ ) _ __ _____      _____  ___ _ __ 
-| |  _| '_ \ / _ \/ __| __|  _ \| '__/ _ \ \ /\ / / __|/ _ \ '__|
-| |_| | | | | (_) \__ \ |_| |_) | | | (_) \ V  V /\__ \  __/ |   
- \____|_| |_|\___/|___/\__|____/|_|  \___/ \_/\_/ |___/\___|_|   
+DISPLAY="${DISPLAY:-:99}"
+SCREEN_RES="${SCREEN_RES:-1280x1024x24}"
+VNC_PASSWORD_FILE="${VNC_PASSWORD_FILE:-/run/secrets/vnc_password}"
+export DISPLAY SCREEN_RES
 
-🐍 Python + 🎭 Playwright + 🖥️ VNC + 📦 Xvfb + 🎛️ Fluxbox
-Dockerhub - shashankrawlani/playwright_python_vnc
-EOF
-
-# ─────────────────────────────────────────────
-# 💡 ENV & SETUP HELPERS
-# ─────────────────────────────────────────────
-# Load from .env if it exists
-if [ -f "/app/.env" ]; then
-    echo "📥 Loading environment from .env"
-    set +u  # allow unbound vars while sourcing .env
-    set -o allexport
-    # shellcheck source=/dev/null
-    source /app/.env
-    set +o allexport
-    set -u
+if [[ ! "${API_KEY_HASH:-}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "ERROR: API_KEY_HASH must be a SHA-256 hex digest" >&2
+  exit 1
+fi
+if [[ ! -r "$VNC_PASSWORD_FILE" ]]; then
+  echo "ERROR: VNC password secret is missing: $VNC_PASSWORD_FILE" >&2
+  exit 1
 fi
 
-export DISPLAY="${DISPLAY:-:99}"
-export USER_DATA_DIR="${USER_DATA_DIR:-/app/user_data}"
-export SCREEN_RES="${SCREEN_RES:-1280x1024x24}"
+mkdir -p "$HOME" /tmp/pyplayvnc-locks /tmp/fluxbox /app/profiles /shared
+chmod 0700 "$HOME" /tmp/pyplayvnc-locks /app/profiles /shared
 
-# PID tracking
-XVFB_PID=""
-X11VNC_PID=""
-FLUXBOX_PID=""
+vnc_password="$(tr -d '\r\n' < "$VNC_PASSWORD_FILE")"
+if (( ${#vnc_password} < 8 )); then
+  echo "ERROR: VNC password must contain at least 8 characters" >&2
+  exit 1
+fi
+x11vnc -storepasswd "$vnc_password" /tmp/pyplayvnc-vnc.pass >/dev/null
+unset vnc_password
+chmod 0600 /tmp/pyplayvnc-vnc.pass
 
-setup_dirs() {
-    mkdir -p "$USER_DATA_DIR" /shared
-    chmod -R 777 "$USER_DATA_DIR" /shared
+pids=()
+# shellcheck disable=SC2329 # Invoked indirectly by the EXIT/TERM/INT trap.
+cleanup() {
+  trap - EXIT INT TERM
+  for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+  wait 2>/dev/null || true
 }
+trap cleanup EXIT INT TERM
 
-check_env() {
-    if [ ! -d "/app" ]; then
-        echo "❌ Must run inside container."
-        exit 1
-    fi
-    echo "✅ Working in /app"
-    echo "✅ DISPLAY=$DISPLAY"
-    echo "✅ USER_DATA_DIR=$USER_DATA_DIR"
-}
+Xvfb "$DISPLAY" -screen 0 "$SCREEN_RES" -nolisten tcp &
+pids+=("$!")
+for _ in $(seq 1 40); do
+  xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 || { echo "ERROR: Xvfb did not start" >&2; exit 1; }
 
-# ─────────────────────────────────────────────
-# 🎛 STARTERS
-# ─────────────────────────────────────────────
+fluxbox -display "$DISPLAY" >/tmp/fluxbox.log 2>&1 &
+pids+=("$!")
 
-start_xvfb() {
-    echo "📦 Starting Xvfb..."
-    Xvfb "$DISPLAY" -screen 0 "$SCREEN_RES" &
-    XVFB_PID=$!
-    # Wait until the display is actually available
-    for i in $(seq 1 10); do
-        xdpyinfo -display "$DISPLAY" >/dev/null 2>&1 && break
-        sleep 0.5
-    done
-    echo "✅ Xvfb ready (PID $XVFB_PID)"
-}
+x11vnc -display "$DISPLAY" -forever -shared -rfbauth /tmp/pyplayvnc-vnc.pass \
+  -rfbport 5900 -o /tmp/x11vnc.log &
+pids+=("$!")
 
-start_vnc() {
-    echo "🖥️  Starting x11vnc..."
-    x11vnc -display "$DISPLAY" -forever -nopw -bg -o /tmp/x11vnc.log
-    X11VNC_PID=$(pgrep -n x11vnc || true)
-    echo "✅ x11vnc ready (PID $X11VNC_PID)"
-}
+python3 -m uvicorn manager.main:app --host 0.0.0.0 --port 8080 --no-server-header &
+pids+=("$!")
 
-start_fluxbox() {
-    echo "🎛️  Starting Fluxbox..."
-    DISPLAY="$DISPLAY" fluxbox &
-    FLUXBOX_PID=$!
-    sleep 1
-    echo "✅ Fluxbox ready (PID $FLUXBOX_PID)"
-}
-
-start_all() {
-    setup_dirs
-    start_xvfb
-    start_vnc
-    start_fluxbox
-}
-
-# ─────────────────────────────────────────────
-# 🔍 ENVIRONMENT CHECKS
-# ─────────────────────────────────────────────
-
-env_check() {
-    echo ""
-    echo "🐍 Python version:" && python --version
-    echo ""
-    echo "🎭 Playwright via Python:"
-    python -c "import importlib.metadata as m; print('✅ Python Playwright version:', m.version('playwright'))" 2>/dev/null \
-        || echo "❌ playwright package not found"
-    echo ""
-    echo "🎭 Playwright CLI:"
-    playwright --version 2>/dev/null || echo "❌ CLI not found"
-    echo ""
-    echo "✅ Environment check complete!"
-}
-
-# ─────────────────────────────────────────────
-# 🧹 CLEANUP
-# ─────────────────────────────────────────────
-
-cleanup_services() {
-    echo "🧹 Stopping services..."
-    # Only kill PIDs that were actually started
-    [ -n "$FLUXBOX_PID" ] && kill "$FLUXBOX_PID" 2>/dev/null || true
-    [ -n "$X11VNC_PID" ]  && kill "$X11VNC_PID"  2>/dev/null || true
-    [ -n "$XVFB_PID" ]    && kill "$XVFB_PID"    2>/dev/null || true
-}
-
-trap cleanup_services INT TERM EXIT
-
-# ─────────────────────────────────────────────
-# 🚀 BOOTSTRAP
-# ─────────────────────────────────────────────
-
-check_env
-start_all
-env_check
-
-# Stay alive — wait on Xvfb so container exits cleanly if it dies
-wait "$XVFB_PID"
+wait -n "${pids[@]}"
+echo "ERROR: a required PyPlayVNC service exited" >&2
+exit 1

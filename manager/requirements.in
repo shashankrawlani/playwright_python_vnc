@@ -1,0 +1,5 @@
+fastapi==0.139.0
+playwright==1.61.0
+pydantic==2.13.4
+PyYAML==6.0.3
+uvicorn==0.51.0

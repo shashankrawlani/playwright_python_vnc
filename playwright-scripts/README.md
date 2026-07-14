@@ -1,13 +1,12 @@
-# playwright-scripts/
+# Private Playwright scripts
 
-Drop your Playwright automation scripts here.
+This directory is ignored because automation can contain private URLs, selectors, account identifiers, or output. Keep reusable public examples generic and free of credentials.
 
-Scripts in this directory are **not committed** (excluded by `.gitignore` outputs).
-They run inside the container against a specific persona's saved session:
+Use the locked helper in the running container:
 
 ```bash
-docker compose exec -e PERSONA=persona1 playwright-vnc \
-    python3 /app/playwright-scripts/your_script.py
+docker compose exec -e PERSONA=example pyplayvnc \
+  python3 /app/scripts/open_persona.py --url https://example.com --headless
 ```
 
-Use `container/scripts/open_persona.py` as a base template.
+Never log cookies, authorization headers, session storage, local storage, or profile database contents.

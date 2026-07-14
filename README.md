@@ -96,10 +96,10 @@ Store the **raw key** in your password manager. Never put it in `.env` or commit
 
 ## Current Personas
 
-| Name | Account | Purpose |
-|---|---|---|
-| `default` | [REMOVED] | Default persona |
-| `example-persona` | [REMOVED] | Logistics account |
+| Name | Purpose |
+|---|---|
+| `default` | Primary persona — see `profiles/default/persona.yml` |
+| `example-persona` | Logistics account — see `profiles/example-persona/persona.yml` |
 
 ---
 

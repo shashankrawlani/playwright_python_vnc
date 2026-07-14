@@ -57,14 +57,14 @@ the operator to provide the correct key.
 
 ## Current Personas
 
-| Name | Account | Purpose | Status |
-|---|---|---|---|
-| `default` | [REMOVED] | Default persona | logged in |
-| `example-persona` | [REMOVED] | Logistics account | logged in |
+| Name | Purpose | Account |
+|---|---|---|
+| `default` | Primary persona | see `profiles/default/persona.yml` |
+| `example-persona` | Logistics account | see `profiles/example-persona/persona.yml` |
 
-**One persona per task.** Never use the wrong persona for an account. If you need
-`[REMOVED]`, use persona `example-persona`. If you need
-`[REMOVED]`, use persona `default`. There is no overlap.
+**One persona per task.** Each persona maps to exactly one set of accounts defined in its
+`persona.yml`. Read that file to confirm which account a persona is for before acting.
+Never use the wrong persona for an account. There is no overlap between personas.
 
 ---
 
@@ -161,11 +161,11 @@ docker compose exec -e PERSONA=default playwright-vnc \
 
 ### Example — open a specific persona's Gmail headlessly:
 ```bash
-# [REMOVED]
+# default persona (see profiles/default/persona.yml for account)
 docker compose exec -e PERSONA=default playwright-vnc \
     python3 /app/scripts/open_persona.py --url https://mail.google.com --headless
 
-# [REMOVED]
+# example-persona persona (see profiles/example-persona/persona.yml for account)
 docker compose exec -e PERSONA=example-persona playwright-vnc \
     python3 /app/scripts/open_persona.py --url https://mail.google.com --headless
 ```

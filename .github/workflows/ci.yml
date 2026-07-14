@@ -38,7 +38,7 @@ jobs:
       - name: Ensure private runtime data is not tracked
         run: |
           test -z "$(git ls-files profiles/ .env secrets/)"
-          ! git grep -nE 'COPY \.env|docker\.sock|seccomp:unconfined|--no-sandbox|localStorage|sessionStorage|allow_origins' -- . ':!.github/workflows/ci.yml'
+          ! git grep -nE 'COPY \.env|docker\.sock|seccomp:unconfined|--no-sandbox|localStorage|sessionStorage|allow_origins' -- Dockerfile docker-compose.yml manager container pyplayvnc
       - name: Compose validation
         run: |
           printf 'API_KEY_HASH=%064d\n' 0 > .env

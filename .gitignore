@@ -19,11 +19,14 @@ venv/
 env/
 
 # ── Chrome profile data ───────────────────────────────────────
-# Default/ and its contents ARE committed so sessions survive migration.
-# We exclude only large caches, machine-specific locks, and generated data
-# that Chrome recreates automatically.
+# ⚠️ SECURITY: Never commit Chrome session data (cookies, logins, auth tokens)!
+# The Default/ directory contains SENSITIVE data - it is NOT committed.
+# Only persona.yml metadata is tracked.
 
-# Singleton locks — machine-specific, recreated on start
+# Exclude entire Default/ directory (contains cookies, logins, sessions)
+profiles/*/Default/
+
+# Machine-specific lock files (Chrome recreates these)
 profiles/*/SingletonLock
 profiles/*/SingletonCookie
 profiles/*/SingletonSocket

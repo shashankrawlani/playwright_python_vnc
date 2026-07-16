@@ -31,6 +31,10 @@ COPY --chown=pyplayvnc:pyplayvnc container/entry_point.sh container/run_browser.
 COPY --chown=pyplayvnc:pyplayvnc container/scripts/ /app/scripts/
 
 RUN chmod 0755 /app/entry_point.sh /app/run_browser.sh /app/scripts/open_persona.py \
+    && sandbox="$(find /ms-playwright -type f -path '*/chrome-linux64/chrome_sandbox' -print -quit)" \
+    && test -n "$sandbox" \
+    && chown root:root "$sandbox" \
+    && chmod 4755 "$sandbox" \
     && mkdir -p /app/profiles /shared \
     && chown -R pyplayvnc:pyplayvnc /app /shared \
     && chmod 0700 /app/profiles /shared

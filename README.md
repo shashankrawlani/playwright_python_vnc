@@ -9,7 +9,9 @@ A local-only, Dockerized Playwright/Chromium environment with persistent, isolat
 - Every persona API route requires an API key; the service refuses to start without a valid SHA-256 verifier.
 - The raw API key is kept only in memory by the web UI and is never stored in browser storage.
 - Runtime Chrome profiles, `.env`, secrets, shared files, and user automation scripts are excluded from Git and Docker build contexts.
-- The service runs as an unprivileged user with all Linux capabilities dropped, the default seccomp profile, `no-new-privileges`, and a read-only root filesystem.
+- The service and Chromium browser run as an unprivileged user with a read-only root filesystem and Docker's default seccomp profile.
+- Compose drops every Linux capability, then restores only `SETUID`, `SETGID`, `SYS_CHROOT`, and `SYS_ADMIN` so Chromium's root-owned setuid helper can create its PID/network sandbox on hosts that disable unprivileged user namespaces. Chromium drops those setup privileges; the running browser has no effective capabilities.
+- `SYS_ADMIN` is a broad capability and `no-new-privileges` is intentionally incompatible with this fallback sandbox. Keep this stack local-only and do not weaken the remaining controls.
 - The Docker socket is not mounted.
 
 This is a local administration tool, not an Internet-facing service. Use SSH forwarding for remote access.

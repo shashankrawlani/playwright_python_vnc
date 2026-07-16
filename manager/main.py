@@ -54,6 +54,7 @@ _AUTH_FAILURES: dict[str, deque[float]] = defaultdict(deque)
 _AUTH_LOCK = threading.Lock()
 AUTH_WINDOW_SECONDS = 60
 AUTH_MAX_FAILURES = 10
+BROWSER_STARTUP_TIMEOUT_SECONDS = 3.0
 
 
 class Account(BaseModel):
@@ -263,6 +264,54 @@ def _browser_running(name: str) -> tuple[bool, int | None]:
     return (bool(pids), pids[0] if pids else None)
 
 
+def _browser_window_ready(name: str) -> bool:
+    """Return whether X11 has a Chromium window for this persona's profile.
+
+    Uses a plain substring match on the profile path to avoid quoting issues
+    with WM_CLASS encoding.  A window with a matching profile path indicates
+    a fully initialised Chromium instance (not just a spawned process).
+    """
+    try:
+        result = subprocess.run(
+            ["xwininfo", "-display", DISPLAY, "-root", "-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Match the profile path in the WM_CLASS field regardless of quoting.
+    return result.returncode == 0 and str(_persona_dir(name)) in result.stdout
+
+
+BROWSER_STARTUP_TIMEOUT_SECONDS = 1.0
+
+
+def _confirm_browser_startup(
+    process: subprocess.Popen[bytes],
+    name: str,
+    timeout: float = BROWSER_STARTUP_TIMEOUT_SECONDS,
+) -> bool:
+    """Confirm Chromium remains alive for the full startup window.
+
+    Chromium must not exit during the timeout.  Window presence is checked
+    separately by the runtime smoke, because software-only displays may not
+    expose a standard WM_CLASS entry for every browser surface.
+
+    If the process exits before the deadline, startup is rejected and the
+    caller's exception path terminates it to avoid an orphaned process.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+    if process.poll() is None:
+        return True
+    return False
+
+
 def _terminate_browser(name: str) -> list[int]:
     process = _PROCESSES.pop(name, None)
     targeted: set[int] = set(_matching_pids(name))
@@ -430,12 +479,12 @@ def launch_browser(name: str, url: str = "https://example.com"):
                 env={**os.environ, "DISPLAY": DISPLAY},
                 start_new_session=True,
             )
-            time.sleep(0.5)
-            if process.poll() is not None:
+            if not _confirm_browser_startup(process, name):
                 raise RuntimeError("Chromium exited during startup")
             _PROCESSES[name] = process
             return {"status": "launched", "pid": process.pid, "url": target, "persona": name}
         except Exception as exc:
+            _terminate_browser(name)
             _release_profile_lock(name)
             raise HTTPException(status_code=500, detail="Browser launch failed") from exc
         finally:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -83,6 +84,79 @@ def test_launch_rejects_non_http_urls(client: TestClient):
     for url in ("file:///etc/passwd", "javascript:alert(1)", "chrome://settings"):
         response = client.post("/api/personas/example/launch", headers=auth(), params={"url": url})
         assert response.status_code == 422
+
+
+def test_browser_startup_requires_process_to_stay_alive():
+    """If Chromium exits before the timeout, startup is rejected."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.05); raise SystemExit(1)"]
+    )
+    assert manager._confirm_browser_startup(process, "default", timeout=0.2) is False
+
+
+def test_browser_startup_accepts_stable_browser(monkeypatch: pytest.MonkeyPatch):
+    """A browser that stays alive for the full timeout is accepted."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert manager._confirm_browser_startup(process, "default", timeout=0.2) is True
+    finally:
+        process.terminate()
+        process.wait(timeout=1)
+
+
+def test_browser_startup_kills_process_on_failure():
+    """When startup is rejected (process exits before deadline), it is terminated."""
+    # Process exits DURING the 0.2s window (0.15s < deadline): function returns
+    # False, then finally block terminates it (already dead — kill is harmless).
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.15)"]
+    )
+    try:
+        assert manager._confirm_browser_startup(process, "default", timeout=0.3) is False
+        # Process must have exited and been cleaned up.
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+
+
+def test_container_configures_chromium_setuid_sandbox():
+    root = Path(__file__).parents[1]
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "chmod 4755" in dockerfile
+    assert "chrome_sandbox" in dockerfile
+    assert "cap_drop:\n      - ALL" in compose
+    assert "cap_add:" in compose
+    assert "      - SYS_ADMIN" in compose
+    assert "no-new-privileges:true" not in compose
+
+
+def test_ci_requires_a_rendered_browser_runtime_smoke():
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Runtime browser and VNC smoke" in workflow
+    assert "xwininfo" in workflow
+    assert "RFB" in workflow
+    assert "CapEff" in workflow
+    assert workflow.index("trap cleanup EXIT") < workflow.index("api_key='ci-runtime-smoke-key'")
+
+
+def test_publish_requires_tag_commit_on_main_and_release_environment():
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "publish.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "environment: release" in workflow
+    assert "fetch-depth: 0" in workflow
+    assert "+refs/heads/main:refs/remotes/origin/main" in workflow
+    assert "git merge-base --is-ancestor \"$GITHUB_SHA\" refs/remotes/origin/main" in workflow
+    assert "id-token: write" not in workflow
+    assert "attestations: write" not in workflow
 
 
 def test_ui_does_not_persist_key_or_build_dynamic_html(client: TestClient):

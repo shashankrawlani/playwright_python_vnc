@@ -26,8 +26,14 @@ services:
       - /tmp:rw,nosuid,nodev,size=512m,mode=1777
     cap_drop:
       - ALL
-    security_opt:
-      - no-new-privileges:true
+    # Chromium's setuid sandbox needs these capabilities because this host
+    # disables unprivileged user namespaces. The browser still runs non-root,
+    # and the setuid helper drops its setup privileges inside the sandbox.
+    cap_add:
+      - SETGID
+      - SETUID
+      - SYS_ADMIN
+      - SYS_CHROOT
     restart: unless-stopped
 
 secrets:

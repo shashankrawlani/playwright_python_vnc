@@ -67,6 +67,98 @@ jobs:
         run: |
           test "$(docker image inspect pyplayvnc:ci --format '{{.Config.User}}')" = 'pyplayvnc:pyplayvnc'
           test "$(docker run --rm --entrypoint sh pyplayvnc:ci -c 'test ! -e /app/.env && echo ok')" = 'ok'
+      - name: Runtime browser and VNC smoke
+        run: |
+          set -Eeuo pipefail
+          test ! -e .env
+          test ! -e secrets
+          test ! -e profiles/ci-smoke
+          cleanup() {
+            docker compose down >/dev/null 2>&1 || true
+            rm -f profiles/ci-smoke/persona.yml secrets/vnc_password .env
+            rmdir profiles/ci-smoke secrets 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          api_key='ci-runtime-smoke-key'
+          digest="$(printf '%s' "$api_key" | sha256sum | cut -d' ' -f1)"
+          printf 'API_KEY_HASH=%s\n' "$digest" > .env
+          mkdir -p secrets profiles/ci-smoke
+          printf 'ci-runtime-vnc-password\n' > secrets/vnc_password
+          printf 'name: ci-smoke\ndescription: CI runtime smoke persona\n' > profiles/ci-smoke/persona.yml
+          chmod 600 .env secrets/vnc_password profiles/ci-smoke/persona.yml
+          docker tag pyplayvnc:ci shashankrawlani/playwright_python_vnc:1.61.0
+          docker compose up -d --no-build
+          for _ in $(seq 1 30); do
+            test "$(docker inspect -f '{{.State.Health.Status}}' pyplayvnc)" = healthy && break
+            sleep 2
+          done
+          test "$(docker inspect -f '{{.State.Health.Status}}' pyplayvnc)" = healthy
+          x11_before="$(docker exec pyplayvnc xwininfo -display :99 -root -tree \
+            | awk '/children:/{print $1; exit}')"
+          test -n "$x11_before"
+          curl --fail --silent --show-error --request POST \
+            --header "X-API-Key: $api_key" \
+            'http://127.0.0.1:8888/api/personas/ci-smoke/launch?url=https%3A%2F%2Fexample.com'
+          sleep 4
+          curl --fail --silent --show-error \
+            --header "X-API-Key: $api_key" \
+            http://127.0.0.1:8888/api/personas/ci-smoke/status \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["browser_running"] is True'
+          docker exec -i pyplayvnc python3 - <<'PY'
+          from pathlib import Path
+
+          seen = 0
+          no_new_privs = 0
+          for process in Path("/proc").iterdir():
+              if not process.name.isdigit():
+                  continue
+              try:
+                  argv = [
+                      item.decode(errors="replace")
+                      for item in (process / "cmdline").read_bytes().split(b"\0")
+                      if item
+                  ]
+                  if not argv or Path(argv[0]).name != "chrome":
+                      continue
+                  status = {}
+                  for line in (process / "status").read_text().splitlines():
+                      if ":" in line:
+                          key, value = line.split(":", 1)
+                          status[key] = value.strip()
+              except OSError:
+                  continue
+              assert set(status["Uid"].split()) == {"1000"}
+              assert int(status["CapEff"], 16) == 0
+              assert int(status["CapPrm"], 16) == 0
+              assert status["Seccomp"] == "2"
+              no_new_privs += status["NoNewPrivs"] == "1"
+              seen += 1
+          assert seen > 0
+          assert no_new_privs > 0
+          PY
+          rendered=false
+          for _ in $(seq 1 40); do
+            if docker exec pyplayvnc xwininfo -display :99 -root -tree \
+              | grep -F "Example Domain" >/dev/null; then
+              rendered=true
+              break
+            fi
+            sleep 0.5
+          done
+          test "$rendered" = true
+          python3 - <<'PY'
+          import socket
+          with socket.create_connection(("127.0.0.1", 5900), timeout=5) as connection:
+              banner = b""
+              while len(banner) < 12:
+                  chunk = connection.recv(12 - len(banner))
+                  assert chunk
+                  banner += chunk
+              assert banner.startswith(b"RFB ")
+          PY
+          curl --fail --silent --show-error --request POST \
+            --header "X-API-Key: $api_key" \
+            http://127.0.0.1:8888/api/personas/ci-smoke/kill
       - name: Scan image for fixed high and critical vulnerabilities
         run: |
           docker save -o /tmp/pyplayvnc-ci.tar pyplayvnc:ci

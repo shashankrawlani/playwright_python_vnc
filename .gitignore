@@ -23,6 +23,7 @@ dist/
 build/
 
 # Test and Playwright output
+artifacts/
 playwright-report/
 test-results/
 playwright-scripts/outputs/

@@ -14,7 +14,10 @@ A local-only, Dockerized Playwright/Chromium environment with persistent, isolat
 - `SYS_ADMIN` is a broad capability and `no-new-privileges` is intentionally incompatible with this fallback sandbox. Keep this stack local-only and do not weaken the remaining controls.
 - The Docker socket is not mounted.
 
-This is a local administration tool, not an Internet-facing service. Use SSH forwarding for remote access.
+This is a local administration tool, not an Internet-facing service. By default,
+the published ports bind only to the homelab LAN static IP and the current
+Tailscale IP, so you can reach them from `192.168.0.121` or over Tailscale
+without exposing `0.0.0.0`.
 
 ## Components
 
@@ -33,7 +36,60 @@ chmod +x pyplayvnc
 ./pyplayvnc init
 ```
 
+## Installable Skill
+
+This repo ships a sanitized, installable skill bundle in [`skills/`](/home/homelab/repos/playwright_python_vnc/skills).
+Install the bundled PyPlayVNC skill with:
+
+```bash
+npx skills add ./skills --skill pyplayvnc --copy -y
+```
+
 `init` prints a high-entropy API key once. Save it in a password manager. It stores only the SHA-256 verifier in `.env` and writes a separate VNC password to the ignored `secrets/` directory.
+
+By default, `init` writes only the API key hash into `.env`. If you want the raw API key and VNC password written locally too, add `--write-env`.
+
+Infisical is the recovery path for all secrets:
+
+- `API_KEY_HASH`
+- `PYPLAYVNC_KEY`
+- `VNC_PASSWORD`
+
+If those local files are missing, `./pyplayvnc up` will pull them from Infisical before starting the container.
+
+If you want the generated secrets copied into Infisical as well, run:
+
+```bash
+PYPLAYVNC_INFISICAL_PROJECT_ID='<project-id>' ./pyplayvnc init --push-infisical
+```
+
+If you also want the raw values written to the local `.env` file for convenience, add `--write-env`:
+
+```bash
+PYPLAYVNC_INFISICAL_PROJECT_ID='<project-id>' ./pyplayvnc init --write-env --push-infisical
+```
+
+That writes:
+
+- `API_KEY_HASH` for the container
+- `PYPLAYVNC_KEY` for the dashboard API
+- `VNC_PASSWORD` for the VNC client
+
+The raw values are useful for local operators and Infisical sync, but they are not required by the container at runtime.
+
+To rotate the API key and VNC password later, run:
+
+```bash
+./pyplayvnc rotate
+```
+
+Add `PYPLAYVNC_INFISICAL_PROJECT_ID='<project-id>' ./pyplayvnc rotate --push-infisical` if you want the refreshed secrets copied to Infisical too.
+
+To rehydrate local files from Infisical later:
+
+```bash
+PYPLAYVNC_INFISICAL_PROJECT_ID='<project-id>' ./pyplayvnc sync
+```
 
 ```bash
 export PYPLAYVNC_KEY='<raw API key from init>'
@@ -46,13 +102,49 @@ Access locally:
 - Manager: `http://127.0.0.1:8888`
 - VNC: `127.0.0.1:5900` using the local password in `secrets/vnc_password`
 
-For remote access, tunnel both loopback ports:
+For LAN or Tailscale access, use the published host IPs:
+
+- Manager: `http://192.168.0.121:8888` or `http://100.88.246.85:8888`
+- VNC: `192.168.0.121:5900` or `100.88.246.85:5900`
+
+If you prefer SSH forwarding, tunnel both ports instead:
 
 ```bash
 ssh -L 8888:127.0.0.1:8888 -L 5900:127.0.0.1:5900 user@host
 ```
 
-Do not publish either port directly.
+Do not publish either port on `0.0.0.0`.
+
+## Playwright MCP Sidecars
+
+For agentic browser automation, run a separate Playwright MCP sidecar per
+persona. The sidecar uses the existing persona profile under
+`profiles/<persona>/` as its seed, then works from its own private copy under
+`.mcp/profiles/<persona>/`. That keeps VNC/manual use and MCP automation from
+fighting over Chrome's profile lock.
+The sidecar gets a dynamic local port in the `8931-8999` range.
+
+Start it after the persona has been created and logged in once:
+
+```bash
+./pyplayvnc mcp start gmail_automation
+./pyplayvnc mcp status
+```
+
+If you need a fixed port for a specific persona, you can request one:
+
+```bash
+./pyplayvnc mcp start gmail_automation --port 8935
+```
+
+Stop it when you are done:
+
+```bash
+./pyplayvnc mcp stop gmail_automation
+```
+
+The MCP client should point at the returned local SSE URL, for example
+`http://127.0.0.1:8931/sse`.
 
 ## Personas
 

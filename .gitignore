@@ -9,6 +9,7 @@ secrets/
 # Runtime browser data: never commit cookies, login state, history, or profiles
 profiles/
 shared/
+.mcp/
 
 # Python
 __pycache__/

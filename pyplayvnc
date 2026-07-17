@@ -6,6 +6,18 @@ HOST="${PYPLAYVNC_HOST:-127.0.0.1}"
 PORT="${PYPLAYVNC_PORT:-8888}"
 KEY="${PYPLAYVNC_KEY:-}"
 BASE="http://${HOST}:${PORT}"
+MCP_STATE_DIR="${PYPLAYVNC_MCP_STATE_DIR:-${REPO_DIR}/.mcp}"
+MCP_STATE_FILE="${MCP_STATE_FILE:-${MCP_STATE_DIR}/state.json}"
+MCP_PORT_START="${PYPLAYVNC_MCP_PORT_START:-8931}"
+MCP_PORT_END="${PYPLAYVNC_MCP_PORT_END:-8999}"
+MCP_IMAGE="${PYPLAYVNC_MCP_IMAGE:-mcr.microsoft.com/playwright/mcp:latest}"
+MCP_PROFILE_ROOT="${PYPLAYVNC_MCP_PROFILE_ROOT:-${MCP_STATE_DIR}/profiles}"
+INFISICAL_PROJECT_ID="${PYPLAYVNC_INFISICAL_PROJECT_ID:-}"
+INFISICAL_ENV="${PYPLAYVNC_INFISICAL_ENV:-prod}"
+INFISICAL_PATH="${PYPLAYVNC_INFISICAL_PATH:-/playwright_python_vnc}"
+WRITE_ENV_FILE=0
+PUSH_INFISICAL=0
+SYNC_INFISICAL=0
 
 validate_name() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { echo "ERROR: invalid persona name" >&2; exit 2; }
@@ -20,26 +32,451 @@ api() {
     "$@" "${BASE}${path}"
 }
 
+usage() {
+  cat <<'EOF'
+Usage: pyplayvnc <command>
+
+  init [--write-env] [--push-infisical]
+  rotate [--push-infisical]
+  sync [--write-env]
+  mcp start <persona> [--port auto|N]
+  mcp stop <persona>
+  mcp status [persona]
+  up                      Build and start the secured service
+  down                    Stop it; local profiles remain
+  status                  Show service and persona status
+  open [persona] [url]    Launch a persona browser
+  kill [persona]          Stop a persona browser
+  logs                    Follow service logs
+
+Set PYPLAYVNC_KEY to the raw API key printed by `pyplayvnc init`.
+Ports bind to loopback by default. Use SSH forwarding for remote access.
+EOF
+}
+
+push_infisical() {
+  local raw_key="$1" hash="$2" vnc="$3"
+  [[ -n "$INFISICAL_PROJECT_ID" ]] || {
+    echo "ERROR: set PYPLAYVNC_INFISICAL_PROJECT_ID before using --push-infisical" >&2
+    exit 1
+  }
+  command -v infisical >/dev/null 2>&1 || {
+    echo "ERROR: infisical CLI is required for --push-infisical" >&2
+    exit 1
+  }
+  infisical secrets set \
+    --projectId "$INFISICAL_PROJECT_ID" \
+    --env "$INFISICAL_ENV" \
+    --path "$INFISICAL_PATH" \
+    "API_KEY_HASH=$hash" \
+    "PYPLAYVNC_KEY=$raw_key" \
+    "VNC_PASSWORD=$vnc" >/dev/null
+}
+
+pull_infisical() {
+  [[ -n "$INFISICAL_PROJECT_ID" ]] || {
+    echo "ERROR: set PYPLAYVNC_INFISICAL_PROJECT_ID before syncing from Infisical" >&2
+    exit 1
+  }
+  command -v infisical >/dev/null 2>&1 || {
+    echo "ERROR: infisical CLI is required for Infisical sync" >&2
+    exit 1
+  }
+  infisical export \
+    --projectId "$INFISICAL_PROJECT_ID" \
+    --env "$INFISICAL_ENV" \
+    --path "$INFISICAL_PATH" \
+    --format json
+}
+
+sync_from_infisical() {
+  local write_env="${1:-0}"
+  local payload hash raw vnc
+  payload="$(pull_infisical)"
+  hash="$(printf '%s\n' "$payload" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("API_KEY_HASH",""))')"
+  raw="$(printf '%s\n' "$payload" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("PYPLAYVNC_KEY",""))')"
+  vnc="$(printf '%s\n' "$payload" | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("VNC_PASSWORD",""))')"
+  [[ -n "$hash" ]] || { echo "ERROR: API_KEY_HASH not found in Infisical" >&2; exit 1; }
+  [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]] || { echo "ERROR: invalid API_KEY_HASH in Infisical" >&2; exit 1; }
+  [[ -n "$vnc" ]] || { echo "ERROR: VNC_PASSWORD not found in Infisical" >&2; exit 1; }
+  mkdir -p secrets
+  if (( write_env )); then
+    [[ -n "$raw" ]] || { echo "ERROR: PYPLAYVNC_KEY not found in Infisical" >&2; exit 1; }
+    write_local_secrets "$hash" "$raw" "$vnc"
+  else
+    printf 'API_KEY_HASH=%s\n' "$hash" > .env
+    chmod 600 .env
+    printf '%s\n' "$vnc" > secrets/vnc_password
+    chmod 600 secrets/vnc_password
+  fi
+  echo "Synced secrets from Infisical at ${INFISICAL_PATH}."
+}
+
+write_local_secrets() {
+  local hash="$1" raw="$2" vnc="$3"
+  cat > .env <<EOF
+API_KEY_HASH=$hash
+PYPLAYVNC_KEY=$raw
+VNC_PASSWORD=$vnc
+EOF
+  printf '%s\n' "$vnc" > secrets/vnc_password
+  chmod 600 .env secrets/vnc_password
+}
+
+ensure_runtime_secrets() {
+  if [[ -f .env && -f secrets/vnc_password ]]; then
+    return 0
+  fi
+  sync_from_infisical 0
+}
+
+mcp_status_json() {
+  mkdir -p "$MCP_STATE_DIR"
+  if [[ ! -f "$MCP_STATE_FILE" ]]; then
+    printf '{}\n'
+    return
+  fi
+  cat "$MCP_STATE_FILE"
+}
+
+mcp_port_in_use() {
+  local port="$1"
+  ss -lnt "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q ":${port} "
+}
+
+mcp_alloc_port() {
+  python3 - "$MCP_STATE_FILE" "$MCP_PORT_START" "$MCP_PORT_END" <<'PY'
+import json, pathlib, sys
+state_file = pathlib.Path(sys.argv[1])
+start = int(sys.argv[2])
+end = int(sys.argv[3])
+state = {}
+if state_file.exists():
+    try:
+        state = json.loads(state_file.read_text())
+    except Exception:
+        state = {}
+used = {int(v["port"]) for v in state.values() if isinstance(v, dict) and str(v.get("port", "")).isdigit()}
+for port in range(start, end + 1):
+    if port not in used:
+        print(port)
+        raise SystemExit(0)
+raise SystemExit("no free MCP ports available")
+PY
+}
+
+mcp_write_state() {
+  local persona="$1" port="$2" container="$3"
+  mkdir -p "$MCP_STATE_DIR"
+  python3 - "$MCP_STATE_FILE" "$persona" "$port" "$container" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+persona = sys.argv[2]
+port = int(sys.argv[3])
+container = sys.argv[4]
+try:
+    state = json.loads(path.read_text()) if path.exists() else {}
+except Exception:
+    state = {}
+state[persona] = {"port": port, "container": container}
+path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+mcp_remove_state() {
+  local persona="$1"
+  [[ -f "$MCP_STATE_FILE" ]] || return 0
+  python3 - "$MCP_STATE_FILE" "$persona" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+persona = sys.argv[2]
+try:
+    state = json.loads(path.read_text()) if path.exists() else {}
+except Exception:
+    state = {}
+state.pop(persona, None)
+path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+PY
+}
+
+mcp_container_name() {
+  printf 'pyplayvnc-mcp-%s' "$1"
+}
+
+mcp_source_profile() {
+  printf '%s/profiles/%s' "$REPO_DIR" "$1"
+}
+
+mcp_target_profile() {
+  printf '%s/%s' "$MCP_PROFILE_ROOT" "$1"
+}
+
+mcp_seed_profile() {
+  local persona="$1" source target
+  source="$(mcp_source_profile "$persona")"
+  target="$(mcp_target_profile "$persona")"
+  [[ -d "$source" ]] || return 1
+  mkdir -p "$MCP_PROFILE_ROOT"
+  python3 - "$source" "$target" <<'PY'
+import pathlib, shutil, sys
+source = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+if target.exists():
+    shutil.rmtree(target)
+target.mkdir(parents=True, exist_ok=True)
+shutil.copytree(
+    source,
+    target,
+    dirs_exist_ok=True,
+    ignore=shutil.ignore_patterns(
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+        "Cache",
+        "Code Cache",
+        "GPUCache",
+        "GrShaderCache",
+        "DawnGraphiteCache",
+        "GraphiteDawnCache",
+        "Crashpad",
+    ),
+)
+for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+    try:
+        (target / lock).unlink()
+    except FileNotFoundError:
+        pass
+PY
+}
+
+mcp_start() {
+  local persona="$1" requested_port="${2:-auto}" port container profile
+  validate_name "$persona"
+  profile="$(mcp_target_profile "$persona")"
+  if [[ ! -d "$(mcp_source_profile "$persona")" ]]; then
+    echo "ERROR: persona not found: $persona" >&2
+    exit 1
+  fi
+  mcp_seed_profile "$persona"
+  container="$(mcp_container_name "$persona")"
+  if docker ps -a --format '{{.Names}}' | grep -qx "$container"; then
+    docker rm -f "$container" >/dev/null 2>&1 || true
+  fi
+  if [[ "$requested_port" == "auto" || -z "$requested_port" ]]; then
+    port="$(mcp_alloc_port)"
+  else
+    port="$requested_port"
+    if mcp_port_in_use "$port"; then
+      echo "ERROR: port ${port} is already in use" >&2
+      exit 1
+    fi
+  fi
+  docker run -d --rm \
+    --name "$container" \
+    --label "pyplayvnc.mcp.persona=${persona}" \
+    --label "pyplayvnc.mcp.port=${port}" \
+    -p "127.0.0.1:${port}:${port}" \
+    -e "HOME=/tmp/playwright-mcp-home" \
+    -e "PLAYWRIGHT_MCP_HEADLESS=1" \
+    -e "PLAYWRIGHT_MCP_BROWSER_NAME=chromium" \
+    -e "PLAYWRIGHT_MCP_USER_DATA_DIR=/mcp-profiles/${persona}" \
+    -e "PLAYWRIGHT_MCP_PORT=${port}" \
+    -e "PLAYWRIGHT_MCP_HOST=0.0.0.0" \
+    -e "PLAYWRIGHT_MCP_ALLOWED_HOSTS=*" \
+    -v "${MCP_PROFILE_ROOT}:/mcp-profiles" \
+    --entrypoint node \
+    "$MCP_IMAGE" \
+    /app/cli.js --headless --browser chromium --no-sandbox --port "$port" --host 0.0.0.0 --user-data-dir "/mcp-profiles/${persona}" >/dev/null
+  mcp_write_state "$persona" "$port" "$container"
+  echo "MCP started for ${persona} on http://127.0.0.1:${port}/sse"
+}
+
+mcp_stop() {
+  local persona="$1" container
+  validate_name "$persona"
+  container="$(mcp_container_name "$persona")"
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  mcp_remove_state "$persona"
+  echo "MCP stopped for ${persona}"
+}
+
+mcp_status() {
+  local persona="${1:-}"
+  if [[ -n "$persona" ]]; then
+    validate_name "$persona"
+  fi
+  python3 - "$MCP_STATE_FILE" "$persona" <<'PY'
+import json, pathlib, subprocess, sys
+state_file = pathlib.Path(sys.argv[1])
+persona = sys.argv[2]
+try:
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+except Exception:
+    state = {}
+rows = []
+for name, entry in state.items():
+    if persona and name != persona:
+        continue
+    port = entry.get("port")
+    container = entry.get("container")
+    status = "missing"
+    if container:
+        probe = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Status}}", container],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0:
+            status = probe.stdout.strip() or "running"
+    rows.append((name, port, status))
+for name, port, status in sorted(rows):
+    print(f"{name:<24} {str(port):<6} {status}")
+PY
+}
+
 case "${1:-help}" in
   init)
     cd "$REPO_DIR"
     umask 077
     mkdir -p secrets profiles shared
+    WRITE_ENV_FILE=1
+    shift || true
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --write-env)
+          WRITE_ENV_FILE=1
+          ;;
+        --push-infisical)
+          PUSH_INFISICAL=1
+          ;;
+        *)
+          echo "ERROR: unknown option: $1" >&2
+          exit 2
+          ;;
+      esac
+      shift
+    done
     if [[ -e .env || -e secrets/vnc_password ]]; then
       echo "ERROR: local secrets already exist; refusing to overwrite" >&2
       exit 1
     fi
     read -r raw hash < <(python3 -c 'import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())')
     vnc="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
-    printf 'API_KEY_HASH=%s\n' "$hash" > .env
-    printf '%s\n' "$vnc" > secrets/vnc_password
-    chmod 600 .env secrets/vnc_password
-    echo "Initialization complete. Save the following API key in your password manager; it will not be stored again:"
+    if (( WRITE_ENV_FILE )); then
+      write_local_secrets "$hash" "$raw" "$vnc"
+    else
+      printf 'API_KEY_HASH=%s\n' "$hash" > .env
+      chmod 600 .env
+    fi
+    if (( PUSH_INFISICAL )); then
+      push_infisical "$raw" "$hash" "$vnc"
+    fi
+    if (( WRITE_ENV_FILE )); then
+      echo "Initialization complete. Local .env written with API key hash, raw API key, and VNC password."
+    else
+      echo "Initialization complete. Local .env written with the API key hash."
+    fi
+    if (( PUSH_INFISICAL )); then
+      echo "Secrets were also pushed to Infisical at ${INFISICAL_PATH}."
+    fi
+    echo "Save the following API key in your password manager; it will not be stored again:"
     printf '%s\n' "$raw"
+    ;;
+  rotate)
+    cd "$REPO_DIR"
+    umask 077
+    mkdir -p secrets profiles shared
+    shift || true
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --push-infisical)
+          PUSH_INFISICAL=1
+          ;;
+        *)
+          echo "ERROR: unknown option: $1" >&2
+          exit 2
+          ;;
+      esac
+      shift
+    done
+    read -r raw hash < <(python3 -c 'import hashlib,secrets; k=secrets.token_urlsafe(32); print(k, hashlib.sha256(k.encode()).hexdigest())')
+    vnc="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+    write_local_secrets "$hash" "$raw" "$vnc"
+    if (( PUSH_INFISICAL )); then
+      push_infisical "$raw" "$hash" "$vnc"
+    fi
+    echo "Secrets rotated."
+    if (( PUSH_INFISICAL )); then
+      echo "New values were also pushed to Infisical at ${INFISICAL_PATH}."
+    fi
+    echo "Update any active session or password manager entry with the following API key:"
+    printf '%s\n' "$raw"
+    ;;
+  sync)
+    cd "$REPO_DIR"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --write-env)
+          WRITE_ENV_FILE=1
+          ;;
+        *)
+          echo "ERROR: unknown option: $1" >&2
+          exit 2
+          ;;
+      esac
+      shift
+    done
+    sync_from_infisical "$WRITE_ENV_FILE"
+    ;;
+  mcp)
+    shift || true
+    case "${1:-help}" in
+      start)
+        [[ $# -ge 2 ]] || { echo "ERROR: usage: pyplayvnc mcp start <persona> [--port auto|N]" >&2; exit 2; }
+        persona="$2"
+        port_arg="auto"
+        shift 2
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --port)
+              [[ $# -ge 2 ]] || { echo "ERROR: --port requires a value" >&2; exit 2; }
+              port_arg="${2:-}"
+              shift 2
+              ;;
+            *)
+              echo "ERROR: unknown option: $1" >&2
+              exit 2
+              ;;
+          esac
+        done
+        mcp_start "$persona" "$port_arg"
+        ;;
+      stop)
+        [[ $# -ge 2 ]] || { echo "ERROR: usage: pyplayvnc mcp stop <persona>" >&2; exit 2; }
+        mcp_stop "$2"
+        ;;
+      status)
+        mcp_status "${2:-}"
+        ;;
+      help|*)
+        cat <<'EOF'
+Usage: pyplayvnc mcp <start|stop|status>
+
+  start <persona> [--port auto|N]
+  stop  <persona>
+  status [persona]
+
+Starts a standalone Playwright MCP sidecar per persona. The sidecar uses the
+existing persona profile under ./profiles/<persona> and listens on a dynamic
+local port in the 8931-8999 range by default.
+EOF
+        ;;
+    esac
     ;;
   up)
     cd "$REPO_DIR"
-    [[ -f .env && -f secrets/vnc_password ]] || { echo "ERROR: run 'pyplayvnc init' first" >&2; exit 1; }
+    ensure_runtime_secrets
     docker compose up -d --build
     echo "Manager: http://127.0.0.1:8888"
     echo "VNC: 127.0.0.1:5900 (password is in local secrets/vnc_password)"
@@ -54,7 +491,7 @@ case "${1:-help}" in
     api GET /api/personas | python3 -c 'import json,sys
 for p in json.load(sys.stdin):
  s="running" if p["browser_running"] else ("session" if p["has_session"] else "new")
- print(f"{p[\"name\"]:<24} {s}")'
+ print(f"{p['name']:<24} {s}")'
     ;;
   open)
     name="${2:-default}"
@@ -76,19 +513,6 @@ for p in json.load(sys.stdin):
     docker compose logs -f pyplayvnc
     ;;
   help|*)
-    cat <<'EOF'
-Usage: pyplayvnc <command>
-
-  init                    Generate local API/VNC secrets (one time)
-  up                      Build and start the secured service
-  down                    Stop it; local profiles remain
-  status                  Show service and persona status
-  open [persona] [url]    Launch a persona browser
-  kill [persona]          Stop a persona browser
-  logs                    Follow service logs
-
-Set PYPLAYVNC_KEY to the raw API key printed by `pyplayvnc init`.
-Ports bind to loopback. Use SSH forwarding for remote access.
-EOF
+    usage
     ;;
 esac

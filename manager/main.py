@@ -336,6 +336,7 @@ def _terminate_browser(name: str) -> list[int]:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    _clear_stale_singleton_locks(name)
     _release_profile_lock(name)
     return sorted(targeted)
 

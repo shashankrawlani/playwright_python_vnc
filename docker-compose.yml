@@ -6,8 +6,10 @@ services:
     container_name: pyplayvnc
     init: true
     ports:
-      - "127.0.0.1:5900:5900"
-      - "127.0.0.1:8888:8080"
+      - "${LAN_IP:-192.168.0.77}:5900:5900"
+      - "${LAN_IP:-192.168.0.77}:8888:8080"
+      - "${TAILSCALE_IP:-100.88.246.85}:5900:5900"
+      - "${TAILSCALE_IP:-100.88.246.85}:8888:8080"
     volumes:
       - ./profiles:/app/profiles
       - ./shared:/shared

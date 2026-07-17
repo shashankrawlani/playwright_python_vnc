@@ -1,112 +1,73 @@
-"""
-manager/main.py — Persona Manager API + UI
+"""Secure Persona Manager for PyPlayVNC.
 
-Runs alongside the playwright-vnc container (port 8080 internally, 8888 on host).
-Shares the same profiles/ volume.
-
-Auth:
-  All API and UI routes require:
-    Header:  X-API-Key: <raw-key>
-  The .env stores only the SHA-256 hash (API_KEY_HASH). The raw key never
-  touches disk — store it in your password manager or AI agent config.
-
-REST API:
-  GET    /api/personas                  list all personas
-  GET    /api/personas/{name}           get one persona + status
-  POST   /api/personas                  create persona
-  PUT    /api/personas/{name}           update persona metadata
-  DELETE /api/personas/{name}           delete persona + all profile data
-  POST   /api/personas/{name}/launch    open Chromium for manual login (VNC)
-  POST   /api/personas/{name}/kill      kill running browser session
-  GET    /api/personas/{name}/status    browser running? session saved?
-
-UI:
-  GET /   single-page HTML dashboard
+The manager, Chromium, Xvfb, and VNC run in one container. This avoids mounting the
+host Docker socket. Runtime profiles are local secrets and must never be committed.
 """
 
+from __future__ import annotations
+
+import fcntl
 import hashlib
+import hmac
 import os
+import re
+import shutil
 import signal
 import subprocess
-import shutil
+import threading
+import time
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Optional
+from typing import BinaryIO
+from urllib.parse import urlparse
 
 import yaml
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
-# ─────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────
-
-PROFILES_ROOT = Path(os.getenv("PROFILES_ROOT", "/app/profiles"))
+PROFILES_ROOT = Path(os.getenv("PROFILES_ROOT", "/app/profiles")).resolve()
 DISPLAY = os.getenv("DISPLAY", ":99")
 API_KEY_HASH = os.getenv("API_KEY_HASH", "")
+PERSONA_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+LOCK_ROOT = Path(os.getenv("LOCK_ROOT", "/tmp/pyplayvnc-locks"))
 
-_ms_playwright = Path("/ms-playwright")
-CHROMIUM_BIN: Optional[str] = None
-if _ms_playwright.exists():
-    bins = sorted(_ms_playwright.glob("chromium-*/chrome-linux64/chrome"))
-    if bins:
-        CHROMIUM_BIN = str(bins[-1])
+if not re.fullmatch(r"[0-9a-fA-F]{64}", API_KEY_HASH):
+    raise RuntimeError("API_KEY_HASH must be configured as a 64-character SHA-256 hex digest")
 
-# Container that runs Xvfb — Chrome must exec here for X11 SHM to work
-VNC_CONTAINER: str = os.environ.get("VNC_CONTAINER", "playwright_vnc")
 
-# In-memory PID store  { persona_name: pid }
-_running: dict[str, int] = {}
+def _find_chromium() -> str:
+    configured = os.getenv("CHROMIUM_BIN")
+    if configured and Path(configured).is_file():
+        return configured
+    candidates = list(Path("/ms-playwright").glob("chromium-*/chrome-linux64/chrome"))
+    if not candidates:
+        raise RuntimeError("Playwright Chromium executable not found")
+    return str(max(candidates, key=lambda p: p.stat().st_mtime))
 
-# ─────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────
 
-def _verify_key(request: Request) -> None:
-    """Dependency: validate X-API-Key header against stored hash."""
-    if not API_KEY_HASH:
-        # Auth not configured — warn but allow (dev mode)
-        return
-    raw = request.headers.get("X-API-Key", "")
-    if not raw:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key header")
-    provided_hash = hashlib.sha256(raw.encode()).hexdigest()
-    if provided_hash != API_KEY_HASH:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+CHROMIUM_BIN = _find_chromium()
+_OPERATIONS_LOCK = threading.RLock()
+_PROCESSES: dict[str, subprocess.Popen[bytes]] = {}
+_PROFILE_LOCKS: dict[str, BinaryIO] = {}
+_AUTH_FAILURES: dict[str, deque[float]] = defaultdict(deque)
+_AUTH_LOCK = threading.Lock()
+AUTH_WINDOW_SECONDS = 60
+AUTH_MAX_FAILURES = 10
+BROWSER_STARTUP_TIMEOUT_SECONDS = 3.0
 
-AuthDep = Depends(_verify_key)
-
-# ─────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────
-
-app = FastAPI(
-    title="PyPlayVNC Persona Manager",
-    description="Manage persistent Chrome profiles / personas for PyPlayVNC",
-    version="1.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────
-# Models
-# ─────────────────────────────────────────────
 
 class Account(BaseModel):
-    site: str
-    email: str
+    site: str = Field(min_length=1, max_length=255)
+    email: str = Field(default="", max_length=320)
+
 
 class PersonaMeta(BaseModel):
     name: str
-    description: str = ""
-    accounts: list[Account] = Field(default_factory=list)
-    notes: str = ""
+    description: str = Field(default="", max_length=1000)
+    accounts: list[Account] = Field(default_factory=list, max_length=50)
+    notes: str = Field(default="", max_length=4000)
+
 
 class PersonaStatus(BaseModel):
     name: str
@@ -114,307 +75,434 @@ class PersonaStatus(BaseModel):
     profile_exists: bool
     has_session: bool
     browser_running: bool
-    browser_pid: Optional[int]
+    browser_pid: int | None
+
 
 class CreatePersona(BaseModel):
-    name: str = Field(..., pattern=r"^[a-zA-Z0-9_-]+$")
-    description: str = ""
-    accounts: list[Account] = Field(default_factory=list)
-    notes: str = ""
+    name: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    description: str = Field(default="", max_length=1000)
+    accounts: list[Account] = Field(default_factory=list, max_length=50)
+    notes: str = Field(default="", max_length=4000)
+
 
 class UpdatePersona(BaseModel):
-    description: Optional[str] = None
-    accounts: Optional[list[Account]] = None
-    notes: Optional[str] = None
+    description: str | None = Field(default=None, max_length=1000)
+    accounts: list[Account] | None = Field(default=None, max_length=50)
+    notes: str | None = Field(default=None, max_length=4000)
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+
+def _verify_key(request: Request) -> None:
+    client = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _AUTH_LOCK:
+        failures = _AUTH_FAILURES[client]
+        while failures and now - failures[0] > AUTH_WINDOW_SECONDS:
+            failures.popleft()
+        if len(failures) >= AUTH_MAX_FAILURES:
+            raise HTTPException(status_code=429, detail="Too many failed authentication attempts")
+    raw = request.headers.get("X-API-Key", "")
+    if not raw:
+        with _AUTH_LOCK:
+            _AUTH_FAILURES[client].append(now)
+        raise HTTPException(status_code=401, detail="Missing API key")
+    supplied = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(supplied.lower(), API_KEY_HASH.lower()):
+        with _AUTH_LOCK:
+            _AUTH_FAILURES[client].append(now)
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    with _AUTH_LOCK:
+        _AUTH_FAILURES.pop(client, None)
+
+
+Auth = Depends(_verify_key)
+app = FastAPI(
+    title="PyPlayVNC Persona Manager",
+    version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+        "form-action 'self'; frame-ancestors 'none'"
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
+
+
+def _validate_name(name: str) -> str:
+    if not PERSONA_RE.fullmatch(name):
+        raise HTTPException(status_code=422, detail="Invalid persona name")
+    return name
+
 
 def _persona_dir(name: str) -> Path:
-    return PROFILES_ROOT / name
+    safe_name = _validate_name(name)
+    candidate = (PROFILES_ROOT / safe_name).resolve()
+    if candidate.parent != PROFILES_ROOT:
+        raise HTTPException(status_code=422, detail="Invalid persona path")
+    return candidate
+
 
 def _meta_path(name: str) -> Path:
     return _persona_dir(name) / "persona.yml"
 
+
 def _read_meta(name: str) -> PersonaMeta:
-    path = _meta_path(name)
+    safe_name = _validate_name(name)
+    path = _meta_path(safe_name)
     if not path.exists():
-        return PersonaMeta(name=name)
-    with open(path) as f:
-        data = yaml.safe_load(f) or {}
-    return PersonaMeta(
-        name=data.get("name", name),
-        description=data.get("description", ""),
-        accounts=[Account(**a) for a in data.get("accounts", [])],
-        notes=data.get("notes", ""),
-    )
-
-def _write_meta(meta: PersonaMeta) -> None:
-    path = _meta_path(meta.name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.dump(
-            {
-                "name": meta.name,
-                "description": meta.description,
-                "accounts": [a.model_dump() for a in meta.accounts],
-                "notes": meta.notes,
-            },
-            f,
-            default_flow_style=False,
-            allow_unicode=True,
-        )
-
-def _has_session(name: str) -> bool:
-    d = _persona_dir(name)
-    return (d / "Default" / "Cookies").exists() or \
-           (d / "Default" / "Network" / "Cookies").exists()
-
-def _browser_running(name: str) -> tuple[bool, Optional[int]]:
-    pid = _running.get(name)
-    if pid is None:
-        # Also check if Chrome is running in VNC container even if not tracked
-        live_pid = _chrome_pid_in_vnc(name)
-        if live_pid:
-            _running[name] = live_pid
-            return True, live_pid
-        return False, None
-    # Verify the PID is still alive inside the VNC container
+        return PersonaMeta(name=safe_name)
     try:
-        result = subprocess.run(
-            ["docker", "exec", VNC_CONTAINER, "kill", "-0", str(pid)],
-            capture_output=True, timeout=3
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return PersonaMeta(
+            name=safe_name,
+            description=data.get("description", ""),
+            accounts=[Account(**a) for a in data.get("accounts", [])],
+            notes=data.get("notes", ""),
         )
-        if result.returncode == 0:
-            return True, pid
-    except Exception:
-        pass
-    # PID dead — check if a new Chrome spawned
-    live_pid = _chrome_pid_in_vnc(name)
-    if live_pid:
-        _running[name] = live_pid
-        return True, live_pid
-    _running.pop(name, None)
-    return False, None
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise HTTPException(status_code=500, detail=f"Invalid persona metadata for {safe_name}") from exc
 
 
-def _chrome_pid_in_vnc(name: str) -> Optional[int]:
-    """Return Chrome PID inside the VNC container for this persona, or None."""
-    try:
-        result = subprocess.run(
-            ["docker", "exec", VNC_CONTAINER, "pgrep", "-n", "-f",
-             f"chrome.*{_persona_dir(name)}"],
-            capture_output=True, text=True, timeout=5
-        )
-        s = result.stdout.strip()
-        return int(s) if s.isdigit() else None
-    except Exception:
-        return None
+def _write_meta(name: str, meta: PersonaMeta) -> None:
+    path = _meta_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    payload = {
+        "name": name,
+        "description": meta.description,
+        "accounts": [a.model_dump() for a in meta.accounts],
+        "notes": meta.notes,
+    }
+    temp = path.with_suffix(".yml.tmp")
+    temp.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    temp.chmod(0o600)
+    os.replace(temp, path)
+
 
 def _list_personas() -> list[str]:
     if not PROFILES_ROOT.exists():
         return []
     return sorted(
-        d.name for d in PROFILES_ROOT.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
+        item.name
+        for item in PROFILES_ROOT.iterdir()
+        if item.is_dir() and PERSONA_RE.fullmatch(item.name) and (item / "persona.yml").is_file()
     )
 
-def _build_status(name: str) -> PersonaStatus:
+
+def _has_session(name: str) -> bool:
+    directory = _persona_dir(name)
+    return any(
+        path.exists()
+        for path in (
+            directory / "Default" / "Cookies",
+            directory / "Default" / "Network" / "Cookies",
+        )
+    )
+
+
+def _profile_arg(name: str) -> str:
+    return f"--user-data-dir={_persona_dir(name)}"
+
+
+def _matching_pids(name: str) -> list[int]:
+    expected = _profile_arg(name)
+    matches: list[int] = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            args = (proc / "cmdline").read_bytes().split(b"\0")
+            decoded = [arg.decode("utf-8", "replace") for arg in args if arg]
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        if expected in decoded and decoded and Path(decoded[0]).name in {"chrome", "chromium", "chromium-browser"}:
+            matches.append(int(proc.name))
+    return sorted(matches)
+
+
+def _release_profile_lock(name: str) -> None:
+    handle = _PROFILE_LOCKS.pop(name, None)
+    if handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _acquire_profile_lock(name: str) -> None:
+    if name in _PROFILE_LOCKS:
+        return
+    LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = open(LOCK_ROOT / f"{name}.lock", "a+b")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise HTTPException(status_code=409, detail="Persona is locked by another browser process") from exc
+    _PROFILE_LOCKS[name] = handle
+
+
+def _browser_running(name: str) -> tuple[bool, int | None]:
+    process = _PROCESSES.get(name)
+    if process and process.poll() is None:
+        return True, process.pid
+    if process:
+        _PROCESSES.pop(name, None)
+        _release_profile_lock(name)
+    pids = _matching_pids(name)
+    return (bool(pids), pids[0] if pids else None)
+
+
+def _browser_window_ready(name: str) -> bool:
+    """Return whether X11 has a Chromium window for this persona's profile.
+
+    Uses a plain substring match on the profile path to avoid quoting issues
+    with WM_CLASS encoding.  A window with a matching profile path indicates
+    a fully initialised Chromium instance (not just a spawned process).
+    """
+    try:
+        result = subprocess.run(
+            ["xwininfo", "-display", DISPLAY, "-root", "-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # Match the profile path in the WM_CLASS field regardless of quoting.
+    return result.returncode == 0 and str(_persona_dir(name)) in result.stdout
+
+
+BROWSER_STARTUP_TIMEOUT_SECONDS = 1.0
+
+
+def _confirm_browser_startup(
+    process: subprocess.Popen[bytes],
+    name: str,
+    timeout: float = BROWSER_STARTUP_TIMEOUT_SECONDS,
+) -> bool:
+    """Confirm Chromium remains alive for the full startup window.
+
+    Chromium must not exit during the timeout.  Window presence is checked
+    separately by the runtime smoke, because software-only displays may not
+    expose a standard WM_CLASS entry for every browser surface.
+
+    If the process exits before the deadline, startup is rejected and the
+    caller's exception path terminates it to avoid an orphaned process.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+    if process.poll() is None:
+        return True
+    return False
+
+
+def _terminate_browser(name: str) -> list[int]:
+    process = _PROCESSES.pop(name, None)
+    targeted: set[int] = set(_matching_pids(name))
+    if process and process.poll() is None:
+        targeted.add(process.pid)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    else:
+        for pid in targeted:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and _matching_pids(name):
+        time.sleep(0.1)
+    remaining = _matching_pids(name)
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    _clear_stale_singleton_locks(name)
+    _release_profile_lock(name)
+    return sorted(targeted)
+
+
+def _clear_stale_singleton_locks(name: str) -> None:
+    directory = _persona_dir(name)
+    for filename in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (directory / filename).unlink(missing_ok=True)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="Unable to remove a stale browser lock") from exc
+
+
+def _safe_url(url: str) -> str:
+    if len(url) > 4096:
+        raise HTTPException(status_code=422, detail="URL is too long")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=422, detail="Only absolute HTTP(S) URLs are allowed")
+    return url
+
+
+def _status(name: str) -> PersonaStatus:
+    directory = _persona_dir(name)
     running, pid = _browser_running(name)
     return PersonaStatus(
         name=name,
         meta=_read_meta(name),
-        profile_exists=_persona_dir(name).exists(),
+        profile_exists=directory.exists(),
         has_session=_has_session(name),
         browser_running=running,
         browser_pid=pid,
     )
 
-# ─────────────────────────────────────────────
-# Routes — UI
-# ─────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/", response_class=HTMLResponse)
 def ui():
-    """Serve the single-page dashboard. Auth is enforced client-side via stored key."""
-    template = Path(__file__).parent / "templates" / "index.html"
-    return HTMLResponse(content=template.read_text())
+    return HTMLResponse((Path(__file__).parent / "templates" / "index.html").read_text(encoding="utf-8"))
 
-# ─────────────────────────────────────────────
-# Routes — Personas
-# ─────────────────────────────────────────────
 
-@app.get("/api/personas", response_model=list[PersonaStatus], dependencies=[AuthDep])
+@app.get("/static/app.js")
+def app_javascript():
+    content = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+    return Response(content, media_type="application/javascript")
+
+
+@app.get("/api/personas", response_model=list[PersonaStatus], dependencies=[Auth])
 def list_personas():
-    return [_build_status(n) for n in _list_personas()]
+    with _OPERATIONS_LOCK:
+        return [_status(name) for name in _list_personas()]
 
 
-@app.get("/api/personas/{name}", response_model=PersonaStatus, dependencies=[AuthDep])
+@app.get("/api/personas/{name}", response_model=PersonaStatus, dependencies=[Auth])
 def get_persona(name: str):
-    if not _persona_dir(name).exists():
-        raise HTTPException(404, f"Persona '{name}' not found")
-    return _build_status(name)
+    directory = _persona_dir(name)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Persona not found")
+    with _OPERATIONS_LOCK:
+        return _status(name)
 
 
-@app.post("/api/personas", response_model=PersonaStatus, status_code=201, dependencies=[AuthDep])
+@app.post("/api/personas", response_model=PersonaStatus, status_code=201, dependencies=[Auth])
 def create_persona(body: CreatePersona):
-    if _persona_dir(body.name).exists():
-        raise HTTPException(409, f"Persona '{body.name}' already exists")
-    meta = PersonaMeta(name=body.name, description=body.description,
-                       accounts=body.accounts, notes=body.notes)
-    _write_meta(meta)
-    return _build_status(body.name)
+    name = _validate_name(body.name)
+    with _OPERATIONS_LOCK:
+        directory = _persona_dir(name)
+        if directory.exists():
+            raise HTTPException(status_code=409, detail="Persona already exists")
+        meta = PersonaMeta(name=name, description=body.description, accounts=body.accounts, notes=body.notes)
+        _write_meta(name, meta)
+        return _status(name)
 
 
-@app.put("/api/personas/{name}", response_model=PersonaStatus, dependencies=[AuthDep])
+@app.put("/api/personas/{name}", response_model=PersonaStatus, dependencies=[Auth])
 def update_persona(name: str, body: UpdatePersona):
-    if not _persona_dir(name).exists():
-        raise HTTPException(404, f"Persona '{name}' not found")
-    meta = _read_meta(name)
-    if body.description is not None: meta.description = body.description
-    if body.accounts is not None:    meta.accounts = body.accounts
-    if body.notes is not None:       meta.notes = body.notes
-    _write_meta(meta)
-    return _build_status(name)
+    directory = _persona_dir(name)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Persona not found")
+    with _OPERATIONS_LOCK:
+        meta = _read_meta(name)
+        if body.description is not None:
+            meta.description = body.description
+        if body.accounts is not None:
+            meta.accounts = body.accounts
+        if body.notes is not None:
+            meta.notes = body.notes
+        _write_meta(name, meta)
+        return _status(name)
 
 
-@app.delete("/api/personas/{name}", status_code=204, dependencies=[AuthDep])
+@app.delete("/api/personas/{name}", status_code=204, dependencies=[Auth])
 def delete_persona(name: str):
-    if not _persona_dir(name).exists():
-        raise HTTPException(404, f"Persona '{name}' not found")
-    running, pid = _browser_running(name)
-    if running and pid:
-        try: os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError: pass
-        _running.pop(name, None)
-    shutil.rmtree(_persona_dir(name))
+    directory = _persona_dir(name)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Persona not found")
+    with _OPERATIONS_LOCK:
+        _terminate_browser(name)
+        if _matching_pids(name):
+            raise HTTPException(status_code=409, detail="Browser is still using this persona")
+        _acquire_profile_lock(name)
+        try:
+            shutil.rmtree(directory)
+        finally:
+            _release_profile_lock(name)
+    return Response(status_code=204)
 
 
-# ─────────────────────────────────────────────
-# Routes — Browser Control
-# ─────────────────────────────────────────────
-
-def _clear_chrome_locks(profile_dir: Path) -> None:
-    """Remove stale Chrome lock files left by crashes or unclean container stops."""
-    for f in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-        (profile_dir / f).unlink(missing_ok=True)
-    default = profile_dir / "Default"
-    if default.exists():
-        for f in ["Login Data-journal", "History-journal", "Favicons-journal",
-                  "Web Data-journal", "Shortcuts-journal",
-                  "Login Data-shm", "Login Data-wal"]:
-            (default / f).unlink(missing_ok=True)
-        # Clear segmentation platform DB lock (causes SIGTRAP on relaunch)
-        for seg_dir in ["segmentation_platform", "Segmentation Platform"]:
-            seg = default / seg_dir
-            if seg.exists():
-                for lock in seg.rglob("LOCK"):
-                    try:
-                        lock.unlink()
-                    except OSError:
-                        pass
-        # Clear all remaining LOCK files
-        for lock in default.rglob("LOCK"):
-            try:
-                lock.unlink()
-            except OSError:
-                pass
-
-
-@app.post("/api/personas/{name}/launch", dependencies=[AuthDep])
-def launch_browser(name: str, url: str = "https://mail.google.com"):
-    """
-    Launch raw Chromium for this persona. No Playwright — Google cannot detect it.
-    The user logs in manually via VNC (localhost:5900).
-    """
-    if not _persona_dir(name).exists():
-        raise HTTPException(404, f"Persona '{name}' not found")
-
-    running, pid = _browser_running(name)
-    if running:
-        return {"status": "already_running", "pid": pid}
-
-    if not CHROMIUM_BIN or not Path(CHROMIUM_BIN).exists():
-        raise HTTPException(503, "Chromium binary not found. Run from inside the playwright-vnc container.")
-
-    # Always clear stale lock files before launching
-    _clear_chrome_locks(_persona_dir(name))
-
-    log_path = f"/tmp/chrome_{name}.log"
-    log_file = open(log_path, "w")
-
-    # Chrome MUST run inside the playwright-vnc container so it shares
-    # the same X11 shared-memory segment as Xvfb. Launching from the
-    # manager container causes blank/white screen because MIT-SHM does
-    # not work across container boundaries.
-    cmd = [
-        "docker", "exec", "-d",
-        "-e", f"DISPLAY={DISPLAY}",
-        VNC_CONTAINER,
-        CHROMIUM_BIN,
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-gpu-sandbox",
-        f"--user-data-dir={_persona_dir(name)}",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-gpu-compositing",
-        "--in-process-gpu",
-        "--password-store=basic",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--start-maximized",
-        url,
-    ]
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=log_file,
-    )
-    proc.wait()  # docker exec -d returns immediately with the container's PID in stdout
-
-    # Find the PID of the newly launched Chrome inside the VNC container
-    import time
-    time.sleep(2)
-    try:
-        result = subprocess.run(
-            ["docker", "exec", VNC_CONTAINER, "pgrep", "-n", "-f", f"chrome.*{_persona_dir(name)}"],
-            capture_output=True, text=True, timeout=5
-        )
-        pid = int(result.stdout.strip()) if result.stdout.strip().isdigit() else 0
-    except Exception:
-        pid = 0
-
-    _running[name] = pid
-    return {"status": "launched", "pid": pid, "url": url, "persona": name}
+@app.post("/api/personas/{name}/launch", dependencies=[Auth])
+def launch_browser(name: str, url: str = "https://example.com"):
+    directory = _persona_dir(name)
+    if not directory.exists():
+        raise HTTPException(status_code=404, detail="Persona not found")
+    target = _safe_url(url)
+    with _OPERATIONS_LOCK:
+        running, pid = _browser_running(name)
+        if running:
+            return {"status": "already_running", "pid": pid, "persona": name}
+        _acquire_profile_lock(name)
+        _clear_stale_singleton_locks(name)
+        log_path = Path("/tmp") / f"pyplayvnc-{name}.log"
+        log_handle = open(log_path, "ab", buffering=0)
+        command = [
+            CHROMIUM_BIN,
+            _profile_arg(name),
+            "--password-store=basic",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--start-maximized",
+            target,
+        ]
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=log_handle,
+                stderr=log_handle,
+                env={**os.environ, "DISPLAY": DISPLAY},
+                start_new_session=True,
+            )
+            if not _confirm_browser_startup(process, name):
+                raise RuntimeError("Chromium exited during startup")
+            _PROCESSES[name] = process
+            return {"status": "launched", "pid": process.pid, "url": target, "persona": name}
+        except Exception as exc:
+            _terminate_browser(name)
+            _release_profile_lock(name)
+            raise HTTPException(status_code=500, detail="Browser launch failed") from exc
+        finally:
+            log_handle.close()
 
 
-@app.post("/api/personas/{name}/kill", dependencies=[AuthDep])
+@app.post("/api/personas/{name}/kill", dependencies=[Auth])
 def kill_browser(name: str):
-    running, pid = _browser_running(name)
-    if not running or not pid:
-        return {"status": "not_running"}
-    try:
-        subprocess.run(
-            ["docker", "exec", VNC_CONTAINER, "kill", str(pid)],
-            capture_output=True, timeout=5
-        )
-    except Exception:
-        pass
-    _running.pop(name, None)
-    return {"status": "killed", "pid": pid}
+    _persona_dir(name)
+    with _OPERATIONS_LOCK:
+        killed = _terminate_browser(name)
+    return {"status": "killed" if killed else "not_running", "pids": killed}
 
 
-@app.get("/api/personas/{name}/status", dependencies=[AuthDep])
+@app.get("/api/personas/{name}/status", dependencies=[Auth])
 def browser_status(name: str):
-    running, pid = _browser_running(name)
-    return {
-        "persona": name,
-        "browser_running": running,
-        "pid": pid,
-        "has_session": _has_session(name),
-    }
+    _persona_dir(name)
+    with _OPERATIONS_LOCK:
+        running, pid = _browser_running(name)
+        return {"persona": name, "browser_running": running, "pid": pid, "has_session": _has_session(name)}

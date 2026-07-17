@@ -1,60 +1,43 @@
-version: "3.8"
-
-# PyPlayVNC — Multi-Persona Docker Compose
-#
-# Usage:
-#   Start everything:              docker compose up -d
-#   Start specific persona:        PERSONA=persona1 docker compose up -d
-#   Manual login (open browser):   docker compose exec playwright-vnc /app/run_browser.sh
-#   Stop (profiles preserved):     docker compose down
-#
-# Access:
-#   VNC (live browser view):   localhost:5900   — connect with any VNC viewer
-#   Persona Manager UI/API:    http://localhost:8080
-
 services:
-
-  # ── playwright-vnc ───────────────────────────────────────────────────────
-  # Main container: Xvfb + VNC + Fluxbox + Playwright + Chromium
-  playwright-vnc:
-    image: shashankrawlani/playwright_python_vnc:latest
-    container_name: playwright_vnc
+  pyplayvnc:
+    build:
+      context: .
+    image: shashankrawlani/playwright_python_vnc:1.61.0
+    container_name: pyplayvnc
+    init: true
     ports:
-      - "5900:5900"
-      - "8888:8080"     # manager shares this container's network namespace
+      - "${LAN_IP:-192.168.0.77}:5900:5900"
+      - "${LAN_IP:-192.168.0.77}:8888:8080"
+      - "${TAILSCALE_IP:-100.88.246.85}:5900:5900"
+      - "${TAILSCALE_IP:-100.88.246.85}:8888:8080"
     volumes:
+      - ./profiles:/app/profiles
       - ./shared:/shared
-      - ./profiles:/app/profiles     # host profiles/ ↔ container /app/profiles
     environment:
-      - DISPLAY=:99
-      - SCREEN_RES=1280x1024x24
-      - PERSONA=${PERSONA:-default}
-      - PROFILES_ROOT=/app/profiles
-    security_opt:
-      - seccomp:unconfined            # Chrome needs syscalls blocked by Docker's default seccomp
-    shm_size: '2gb'                   # prevent /dev/shm exhaustion on tab open
+      DISPLAY: ":99"
+      SCREEN_RES: ${SCREEN_RES:-1280x1024x24}
+      PROFILES_ROOT: /app/profiles
+      LOCK_ROOT: /tmp/pyplayvnc-locks
+      API_KEY_HASH: ${API_KEY_HASH:?Set API_KEY_HASH in .env}
+      VNC_PASSWORD_FILE: /run/secrets/vnc_password
+    secrets:
+      - vnc_password
+    shm_size: 2gb
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=512m,mode=1777
+    cap_drop:
+      - ALL
+    # Chromium's setuid sandbox needs these capabilities because this host
+    # disables unprivileged user namespaces. The browser still runs non-root,
+    # and the setuid helper drops its setup privileges inside the sandbox.
+    cap_add:
+      - SETGID
+      - SETUID
+      - SYS_ADMIN
+      - SYS_CHROOT
     restart: unless-stopped
 
-  # ── manager ──────────────────────────────────────────────────────────────
-  # Persona Manager: FastAPI REST API + web UI on port 8080
-  # Shares the same network namespace as playwright-vnc so it can
-  # launch Chromium on the same Xvfb display (:99).
-  manager:
-    image: shashankrawlani/playwright_python_vnc:latest
-    container_name: persona_manager
-    volumes:
-      - ./profiles:/app/profiles     # same volume as playwright-vnc
-      - ./manager:/app/manager       # mount source directly for live-reload
-      - /var/run/docker.sock:/var/run/docker.sock  # needed to docker exec into playwright_vnc
-    environment:
-      - PROFILES_ROOT=/app/profiles
-      - DISPLAY=:99
-      - API_KEY_HASH=${API_KEY_HASH}
-      - VNC_CONTAINER=playwright_vnc
-    network_mode: "service:playwright-vnc"
-    depends_on:
-      - playwright-vnc
-    working_dir: /app
-    command: >-
-      sh -c "apt-get install -yq docker.io 2>/dev/null | tail -1; pip install --no-cache-dir --break-system-packages --quiet fastapi==0.115.14 'uvicorn[standard]==0.34.3' pyyaml==6.0.2 pydantic==2.11.7 && uvicorn manager.main:app --host 0.0.0.0 --port 8080 --reload"
-    restart: unless-stopped
+secrets:
+  vnc_password:
+    file: ./secrets/vnc_password

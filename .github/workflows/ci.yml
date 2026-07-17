@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.lock
+      - name: Install locked test dependencies
+        run: python -m pip install --require-hashes -r tests/requirements.lock
+      - name: Unit tests
+        run: pytest -q
+      - name: Dependency audit
+        run: pip-audit -r manager/requirements.lock
+      - name: Shell syntax and static analysis
+        run: |
+          bash -n pyplayvnc container/entry_point.sh container/run_browser.sh
+          docker run --rm -v "$PWD:/mnt:ro" -w /mnt --entrypoint /bin/shellcheck \
+            koalaman/shellcheck-alpine@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002 \
+            pyplayvnc container/entry_point.sh container/run_browser.sh
+          docker run --rm -i \
+            hadolint/hadolint@sha256:7aba693c1442eb31c0b015c129697cb3b6cb7da589d85c7562f9deb435a6657c \
+            < Dockerfile
+      - name: Ensure private runtime data is not tracked
+        run: |
+          test -z "$(git ls-files profiles/ .env secrets/)"
+          ! git grep -nE 'COPY \.env|docker\.sock|seccomp:unconfined|--no-sandbox|localStorage|sessionStorage|allow_origins' -- Dockerfile docker-compose.yml manager container pyplayvnc
+      - name: Compose validation
+        run: |
+          printf 'API_KEY_HASH=%064d\n' 0 > .env
+          mkdir -p secrets
+          printf 'ci-only-password\n' > secrets/vnc_password
+          docker compose config --quiet
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build hardened image
+        run: docker build --pull --tag pyplayvnc:ci .
+      - name: Inspect image defaults
+        run: |
+          test "$(docker image inspect pyplayvnc:ci --format '{{.Config.User}}')" = 'pyplayvnc:pyplayvnc'
+          test "$(docker run --rm --entrypoint sh pyplayvnc:ci -c 'test ! -e /app/.env && echo ok')" = 'ok'
+      - name: Runtime browser and VNC smoke
+        run: |
+          set -Eeuo pipefail
+          test ! -e .env
+          test ! -e secrets
+          test ! -e profiles/ci-smoke
+          cleanup() {
+            docker compose down >/dev/null 2>&1 || true
+            rm -f profiles/ci-smoke/persona.yml secrets/vnc_password .env
+            rmdir profiles/ci-smoke secrets 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          api_key='ci-runtime-smoke-key'
+          digest="$(printf '%s' "$api_key" | sha256sum | cut -d' ' -f1)"
+          printf 'API_KEY_HASH=%s\n' "$digest" > .env
+          mkdir -p secrets profiles/ci-smoke
+          printf 'ci-runtime-vnc-password\n' > secrets/vnc_password
+          printf 'name: ci-smoke\ndescription: CI runtime smoke persona\n' > profiles/ci-smoke/persona.yml
+          chmod 600 .env secrets/vnc_password profiles/ci-smoke/persona.yml
+          docker tag pyplayvnc:ci shashankrawlani/playwright_python_vnc:1.61.0
+          docker compose up -d --no-build
+          for _ in $(seq 1 30); do
+            test "$(docker inspect -f '{{.State.Health.Status}}' pyplayvnc)" = healthy && break
+            sleep 2
+          done
+          test "$(docker inspect -f '{{.State.Health.Status}}' pyplayvnc)" = healthy
+          x11_before="$(docker exec pyplayvnc xwininfo -display :99 -root -tree \
+            | awk '/children:/{print $1; exit}')"
+          test -n "$x11_before"
+          curl --fail --silent --show-error --request POST \
+            --header "X-API-Key: $api_key" \
+            'http://127.0.0.1:8888/api/personas/ci-smoke/launch?url=https%3A%2F%2Fexample.com'
+          sleep 4
+          curl --fail --silent --show-error \
+            --header "X-API-Key: $api_key" \
+            http://127.0.0.1:8888/api/personas/ci-smoke/status \
+            | python3 -c 'import json,sys; assert json.load(sys.stdin)["browser_running"] is True'
+          docker exec -i pyplayvnc python3 - <<'PY'
+          from pathlib import Path
+
+          seen = 0
+          no_new_privs = 0
+          for process in Path("/proc").iterdir():
+              if not process.name.isdigit():
+                  continue
+              try:
+                  argv = [
+                      item.decode(errors="replace")
+                      for item in (process / "cmdline").read_bytes().split(b"\0")
+                      if item
+                  ]
+                  if not argv or Path(argv[0]).name != "chrome":
+                      continue
+                  status = {}
+                  for line in (process / "status").read_text().splitlines():
+                      if ":" in line:
+                          key, value = line.split(":", 1)
+                          status[key] = value.strip()
+              except OSError:
+                  continue
+              assert set(status["Uid"].split()) == {"1000"}
+              assert int(status["CapEff"], 16) == 0
+              assert int(status["CapPrm"], 16) == 0
+              assert status["Seccomp"] == "2"
+              no_new_privs += status["NoNewPrivs"] == "1"
+              seen += 1
+          assert seen > 0
+          assert no_new_privs > 0
+          PY
+          rendered=false
+          for _ in $(seq 1 40); do
+            if docker exec pyplayvnc xwininfo -display :99 -root -tree \
+              | grep -F "Example Domain" >/dev/null; then
+              rendered=true
+              break
+            fi
+            sleep 0.5
+          done
+          test "$rendered" = true
+          python3 - <<'PY'
+          import socket
+          with socket.create_connection(("127.0.0.1", 5900), timeout=5) as connection:
+              banner = b""
+              while len(banner) < 12:
+                  chunk = connection.recv(12 - len(banner))
+                  assert chunk
+                  banner += chunk
+              assert banner.startswith(b"RFB ")
+          PY
+          curl --fail --silent --show-error --request POST \
+            --header "X-API-Key: $api_key" \
+            http://127.0.0.1:8888/api/personas/ci-smoke/kill
+      - name: Scan image for fixed high and critical vulnerabilities
+        run: |
+          docker save -o /tmp/pyplayvnc-ci.tar pyplayvnc:ci
+          docker run --rm -v /tmp:/scan \
+            aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --input /scan/pyplayvnc-ci.tar --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 --no-progress
